@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -18,10 +19,8 @@ var _ tinykvpb.TinyKvServer = new(Server)
 // Server is a TinyKV server, it 'faces outwards', sending and receiving messages from clients such as TinySQL.
 type Server struct {
 	storage storage.Storage
-
 	// (Used in 4B)
 	Latches *latches.Latches
-
 	// coprocessor API handler, out of course scope
 	copHandler *coprocessor.CopHandler
 }
@@ -83,12 +82,13 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 	return nil, nil
 }
 
-// SQL push down commands.
+// Coprocessor SQL push down commands.
 func (server *Server) Coprocessor(_ context.Context, req *coppb.Request) (*coppb.Response, error) {
 	resp := new(coppb.Response)
 	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
-		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		var regionErr *raft_storage.RegionError
+		if errors.As(err, &regionErr) {
 			resp.RegionError = regionErr.RequestErr
 			return resp, nil
 		}

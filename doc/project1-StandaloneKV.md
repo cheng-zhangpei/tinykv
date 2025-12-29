@@ -6,8 +6,8 @@ The service supports four basic operations: Put/Delete/Get/Scan. It maintains a 
 
 The project can be broken down into 2 steps, including:
 
-1. Implement a standalone storage engine.
-2. Implement raw key/value service handlers.
+1. Implement a standalone storage engine.（要实现一个KV存储引擎）
+2. Implement raw key/value service handlers. （要实现handler，也就是网络服务咯）
 
 ### The Code
 

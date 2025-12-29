@@ -54,6 +54,7 @@ func main() {
 	} else {
 		storage = standalone_storage.NewStandAloneStorage(conf)
 	}
+	// StandAlone or raft model
 	if err := storage.Start(); err != nil {
 		log.Fatal(err)
 	}
@@ -70,12 +71,14 @@ func main() {
 		grpc.InitialConnWindowSize(1<<30),
 		grpc.MaxRecvMsgSize(10*1024*1024),
 	)
+	// register a grpc server
 	tinykvpb.RegisterTinyKvServer(grpcServer, server)
 	listenAddr := conf.StoreAddr[strings.IndexByte(conf.StoreAddr, ':'):]
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
+	// handle the signal in the process of running the server
 	handleSignal(grpcServer)
 
 	err = grpcServer.Serve(l)
