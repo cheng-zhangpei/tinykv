@@ -1,0 +1,133 @@
+## 1.关于rawNode为啥要写ready
+
+**etcd/TinyKV 的设计哲学是：**
+		Raft 只是个大脑（纯内存逻辑），它没有手（不能写磁盘），也没有嘴（不能发消息）。我之前写raft的时候其实就是纯粹的大脑，没有任何的行动力。
+
+​		当大脑思考完（比如决定要发心跳，或者决定要追加日志）后，它**不能直接干**，而是把这些决定**打包**成一个包裹，叫 **`Ready`**
+
+- **Raft (大脑)**: “我思考完了，这是 `Ready` 包裹，里面有 3 条要存盘的日志，和 2 条要发给 Follower 的消息。”
+- **上层应用 (手和嘴)**: “收到！我负责把日志写进 BadgerDB，把消息通过 gRPC 发出去。”
+- **Advance**: 手和嘴干完活了，告诉大脑：“搞定！你可以进行下一轮思考了。”
+
+​		所以综合的来说就是一个通讯机制，rawNode通过ready往上通知具体操作，Advance告诉raft已经搞定啦。
+
+​		Raft 节点的状态分为两类，一类丢了也没事（易失性），一类丢了就完了（持久性）。
+
+- 包含:，Lead` (谁是大哥), `RaftState` (我是啥角色: Follower/Leader)。
+- 特点，不需要存磁盘如果节点崩溃重启，它变成 Follower 就行了，不需要记得上次谁是 Leader，等收到新 Leader 的心跳自然就知道了。
+- 在 Ready 里的作用，主要用于**UI展示**或者**触发上层回调**。比如上层代码发现 `SoftState.Lead` 变了，可能需要打印一条日志：“Leader 变更为节点 2 了！”。
+
+#### `HardState` (硬状态 / 持久性)
+
+- **包含**: `Term` (任期), `Vote` (投给谁了), `Commit` (提交进度)。
+- 必须存磁盘（WAL）且必须在发网络消息，之前存盘（Safety 要求）。
+  - **Term & Vote**: 防止重启后重复投票（如果忘了投过票，可能会导致一个 Term 选出两个 Leader）。
+  - **Commit**: 防止重启后已提交的数据回滚。
+- 在 Ready 里的作用:上层收到 `Ready` 后，如果发现 `HardState` 不为空，**必须**把它写入 BadgerDB。
+
+说白了HardState是在进行具体操作之前必须要**同步WAL存盘**，因为安全性咯
+
+----
+
+## 2. RawNode 为什么要存 `prevSoftState` 和 `prevHardState`？
+
+因为 `RawNode` 的 `Ready()` 方法可能会被频繁调用，但我们**不想每次都全量输出**。
+
+- **场景**: `tick()` 触发了，但没有任何状态改变。
+- **如果没有 prev**: `Ready()` 每次都要构造一个新的 SoftState/HardState 返回出去，上层拿到一看，跟上次一样，白忙活一场（写磁盘是要开销的！）。
+- 有了 prev
+  - `RawNode` 会比较：`Current.Term == prevHardState.Term`？
+  - 如果一样，那 `Ready.HardState` 就留空。
+  - 上层看到空的 HardState，就知道不用写磁盘了，性能提升巨大。
+
+---
+
+## 日志的全部结构
+
+​		Raft 的日志并不是简单的“一层层往下漏”，而是一个**时间窗口**的概念。我们可以把整个日志历史想象成一条无限长的传送带，但是我们只能保留其中的一小段。
+
+#### 层级 1: `Unstable` (内存 - 缓冲区)
+
+- **位置**: `RaftLog.entries` 中 `Index > stabled` 的部分。
+- **物理**: 纯内存切片。
+- 来源
+  - **Leader**: 刚从客户端收到的 `Propose` 请求。
+  - **Follower**: 刚从 Leader 那里 `AppendEntries` 同步过来的。
+- **命运**: 它们非常危险，断电就丢。所以 `Ready()` 会第一时间把它们送去持久化。
+
+#### 层级 2: `Stable` (内存 + 磁盘镜像)
+
+- **位置**: `RaftLog.entries` 中 `Index <= stabled` 的部分。
+
+- **物理**: 也在 `RaftLog.entries` 内存里！但同时已经在 `Storage`（BadgerDB）里有一份拷贝了。
+
+- 意义: 既然磁盘有了，为啥内存还要留着？
+
+  为了读得快！
+
+  - 如果 Follower 落后了，找 Leader 要 Log Index=100 的日志，Leader 直接从内存 `entries` 里拿，不用去查磁盘，性能极高。
+
+- **命运**: 随着时间推移，这部分日志越积越多，内存撑不住了，就要进行 **Truncate (截断)**，也就是 **Compact**。这个Compact的本质就是一个merge操作，将一大堆数据统合成一个关键的快照
+
+#### 层级 3: `Storage` (磁盘 - 归档区)
+
+- **位置**: 在 BadgerDB 里。
+- **物理**: 硬盘上的 SST 文件。
+- 意义: 它是Stable日志的全量备份
+  - 当 `Stable` 日志从内存中被 Compact 掉之后，如果还需要查旧日志（比如有个 Follower 掉线了一万年，现在才回来），就只能去 Storage 里查了（这很慢）。
+  - 或者，如果旧日志实在太老了，Storage 里也会把它删掉，只保留一个 **Snapshot**。
+
+#### 层级 4: `Snapshot` (快照 - 压缩包)
+
+- **本质**: **“时间被压缩了”**。
+- **意义**: Index=1 到 Index=10000 的所有日志，执行完的结果就是 `x=5, y=10`。那存这 10000 条日志太浪费了，直接存 `Index=10000, State={x=5, y=10}` 就行了。
+- 关系
+  - 当 `Stable` 日志太多时 -> 触发 Compact -> 生成 Snapshot -> 删除旧日志。
+  - `PendingSnapshot`: 这是刚收到（或者刚生成）但还没存稳的快照。
+
+----
+
+## pendingSnapshot的意义
+
+简单说：**PendingSnapshot 是个“外来户”或者“刚出炉的热乎货”，它短暂地存在于内存中，等待被安家落户（存盘）。**
+
+我们可以分两种场景来看 `pendingSnapshot` 的来源：
+
+### 场景 1：Leader 发给我的快照 (2C 主要场景)
+
+- **背景**: 我是一个落后很久的 Follower，我的 NextIndex 是 5，但 Leader 的 Log 已经从 1000 开始了（1-999 都 Compact 掉了）。
+- 过程
+  1. Leader 发给我一个 `MsgSnapshot`。
+  2. Raft 收到后，调用 `handleSnapshot`。
+  3. Raft 发现：“卧槽，这快照太新了，我的旧日志全废了。”
+  4. Raft 把这个快照赋值给 `l.pendingSnapshot`。
+  5. **此时**: 快照数据在内存里（在 `pendingSnapshot` 变量里），还没进 BadgerDB。
+  6. **Ready**: Raft 把 `pendingSnapshot` 打包进 `Ready`。
+  7. **RaftStore**: 上层应用拿到 Ready，把 Snapshot **写入磁盘**，同时清空旧数据。
+  8. **Advance**: 调用 `stableSnapTo`。
+  9. **结果**: `l.pendingSnapshot = nil`（因为已经存盘了），`stabled` 推进到快照的 Index（因为之前的日志都被快照替代了，逻辑上算是“存稳”了）。
+
+### 场景 2：我自己生成的快照 (Project 2C 也会涉及)
+
+- **背景**: 我是 Leader（或者 Follower），我的 Log 太长了，我要 Compact。
+- 过程:
+  1. 上层应用（RaftStore）调用 `storage.Snapshot()`。这通常是异步的，可能涉及到扫描 BadgerDB 里很多 Key 来生成状态镜像。
+  2. 这部分 TinyKV 里是由 `PeerStorage` 处理的，Raft 核心逻辑**不用管**快照是怎么生成的。
+  3. Raft 只需要知道：“哦，Storage 里现在有一个 Index=1000 的快照了。”
+  4. 然后 Raft 调用 `Compact(1000)`，把内存里 Index<=1000 的日志删掉。
+
+综上这个pendingSnapshot本质上只是一个在内存中的中继罢了，一个触发场景是在Storage中的数据非常多的时候跳到
+
+
+
+------
+
+- 在处理信息时候，任期的匹配性问题永远是我们需要第一时间考虑的
+
+- 无论是follower还是leader，这里含有一个很重要的性质就是raft日志一定要有严格的递增性
+
+- 在处理日志数据的时候我们一定需要考虑一下，当前的缓冲区的窗口大小是否可以满足要求，是否会因为Entries过大被compact从而找不到日志？所以我们往往需要考虑从之前的快照部分和storage部分来进行查找也就是将快照发给follower让follower找就是了
+
+- 只要涉及到数据切片，我们都要考虑一下，当前信息是否已经committed，raft中不能修改已经committed的数据。
+- 在我们new一个raft结构的时候我们往往是需要考虑到节点并不是第一次打开，我们要先进行的操作是将
+

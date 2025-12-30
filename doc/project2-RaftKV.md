@@ -7,8 +7,8 @@ In this project, you will implement a high available kv server based on raft,  w
 The project has 3 parts you need to do, including:
 
 - Implement the basic Raft algorithm
-- Build a fault-tolerant KV server on top of Raft
-- Add the support of raftlog GC and snapshot
+- Build a fault-tolerant KV server on top of Raft（这里估计就是完善一些工业特性了）
+- Add the support of raftlog GC and snapshot（所以还要定期清理快照）
 
 ## Part A
 
