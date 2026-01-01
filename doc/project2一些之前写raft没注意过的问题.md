@@ -123,11 +123,59 @@
 ------
 
 - 在处理信息时候，任期的匹配性问题永远是我们需要第一时间考虑的
-
 - 无论是follower还是leader，这里含有一个很重要的性质就是raft日志一定要有严格的递增性
-
 - 在处理日志数据的时候我们一定需要考虑一下，当前的缓冲区的窗口大小是否可以满足要求，是否会因为Entries过大被compact从而找不到日志？所以我们往往需要考虑从之前的快照部分和storage部分来进行查找也就是将快照发给follower让follower找就是了
-
 - 只要涉及到数据切片，我们都要考虑一下，当前信息是否已经committed，raft中不能修改已经committed的数据。
-- 在我们new一个raft结构的时候我们往往是需要考虑到节点并不是第一次打开，我们要先进行的操作是将
+- 在我们new一个raft结构的时候我们往往是需要考虑到节点并不是第一次打开，我们要先进行的操作是将之前磁盘中持久化之后的状态拿出来初始化到这个新的节点中
+- 我们在对内存中的日志缓冲区进行截断的时候是需要考虑到stable这个指针，新append的数据一定是会影响stable指针的位置，因为新的数据一定一开始是unstable的。
+- **Heartbeat immediately after election**
+
+​		在leader被选举出来的瞬间需要广播一次appendMsg，这里的作用其实是让所有的follower在收到appendRequest的时候稍微看一眼自己的日志，哦发现这个msg好像term更高诶？然后就变成follower并且执行append操作去将新leader的日志进行同步一下。
+
+- 这里再说一下appendEntries和对应的response处理的细节，这里大量的细节需要注意，是需要经验和记忆的，自己去碰这样的坑基本是很难很难的。
+
+handleAppendEntries:
+
+这个函数是follower/candidate触发的，大体的流程如下：
+
+1） 先查一下这个msg的term是不是落后自己的？如果是落后，就reject，和leader说一下（这个地方没有冲突检测）
+
+2）再看看，leader原来progress里面记录的follower的最新的index和任期应该是咋样的，和现在follower最新状态对比一下，如果不一样，好家伙leader不对，这个时候就要follower和leader对齐一下咯，就是冲突检测，因为TinyKV没有用rejectHint加速就是一个个回退就好了呗
+
+3）这个时候就可以正式将这部分的entries放到自己的unstable部分的存储了。这个时候又有折断的问题，就是发来的起点可能不是刚刚好顺延自己lastIndex往后的。
+
+4）最后更新当前的committed指针，这个指针是取leader的committed指针和follower的committed指针的较小值。
+
+handleAppendResponse
+
+1) 对于leader，先看看follower是否接受了这个消息，如果拒绝了就要开始回退了，也就是把Progress回退，然后把现在回退之后leader所期待follower的状态发给follower让follower看看现在ok了不？
+2) 如果ok了就更新自己的Progress，也就是自身状态，然后尝试修改自身的committed指针
+3) 这个committed指针就是这个集群绝大多数节点都认同的日志提交位置，所以这个时候我要遍历所有的progress，然后将所有的follower的Match的位置拿出来，我要找到所有的follower都match的位置作为我现在的commit指针
+
+---
+
+- 对于follower的committed指针更新位置
+
+​		我们会在follower处理AppendLogEntries的时候更新一次committed，但是我们还需要在心跳部分持续的推进更新committed，如果只是在append时候更新，那么follower状态推进的就会很慢，持久化的也会很慢。
+
+- 在我们将Progress中的数据要发送给别人的缓冲区的时候有一个坑，我们progress中记录的全局的日志索引，比如101、102这种，是包含被compact和storage的数据，但是对于别人来说是要放到unstable的数组里面这里就有一个映射，所以要转化一下把自己unstable部分的数据拿出来给别人
+- 我们在初始化一个节点的时候，在初始化Progress的时候需要注意我们要从lastIndex开始更新，
+
+```go
+r.Prs[p] = &Progress{Next: lastIndex + 1, Match: 0}
+```
+
+因为可能会持久化部分的数据要通过下面这个函数拿出来
+
+```go
+lastIndex := r.RaftLog.LastIndex()
+```
+
+- 一个很恐怖的问题，我们在测试的时候发现Match的推进问题，会导致Commit推不上去。
+
+​		我们更新任何的一个Match的时候其实都是在handlePropose里面进行的，但是有一个特例，一个leader在becomeLeader的时候是会执行一个No-ops的append操作，这个操作我当时没有更新Match，我是直接去bastAppend()的了，让所有的节点知道现在发生的leader的变更（因为心跳不会立刻开始）
+
+​		如果没有更新的后果：Leader 自己都不知道自己拥有这条 No-Op 日志（Match 没跟上），导致 Quorum 计算少了一票，Commit 推不动。
+
+​	-> 所以说明，分布式系统分层非常重要，什么是原生接口，原生接口的功能是啥，如果调用路口太多有时候就会有地方没有更新到位。
 

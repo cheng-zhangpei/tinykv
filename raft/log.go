@@ -53,24 +53,28 @@ type RaftLog struct {
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	// At first I think we can not load all the committed log entries into the memory, but in TinyKV,We have
-	// compact operation so at least we just load thousands of the log entries into the memory
+	// 1. 获取 Storage 状态
 	firstIndex, _ := storage.FirstIndex()
 	lastIndex, _ := storage.LastIndex()
 
+	// 2. 加载 entries
+	// 注意：firstIndex 可能比 lastIndex 大（比如 Storage 为空），这时候 entries 应该是 nil
+	// Storage.Entries(first, last+1)
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
 		panic(err)
 	}
 
+	// 3. 初始化 RaftLog
 	l := &RaftLog{
 		storage:         storage,
 		committed:       firstIndex - 1,
 		applied:         firstIndex - 1,
-		stabled:         lastIndex,
+		stabled:         lastIndex, // 刚从 storage 读出来，肯定都是 stable 的
 		entries:         entries,
 		pendingSnapshot: nil,
 	}
+
 	return l
 }
 
@@ -95,23 +99,19 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // return all entries before stabled pointer
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	if len(l.entries) == 0 {
-		return nil
+		return make([]pb.Entry, 0) // return empty slice, not nil
 	}
-	firstIndex := l.entries[0].Index
-	// avoid the len exceed the len of the whole entries
-	// assume first=100, stabled=100,  unstable should begin index=101
-	// index = 101 - 100 = 1
-	// formulation：offset = stabled - firstIndex + 1
-	if l.stabled-firstIndex+1 >= uint64(len(l.entries)) {
-		return nil
-	}
-	// get the offset of the slice
-	offset := l.stabled - firstIndex + 1
 
-	// the whole entries buffer is unstable entries
-	if int64(l.stabled)-int64(firstIndex)+1 < 0 {
+	firstIndex := l.entries[0].Index
+	if l.stabled < firstIndex {
 		return l.entries
 	}
+
+	offset := l.stabled - firstIndex + 1
+	if offset >= uint64(len(l.entries)) {
+		return make([]pb.Entry, 0)
+	}
+
 	return l.entries[offset:]
 }
 
@@ -121,7 +121,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// 边界检查
 	if len(l.entries) == 0 {
-		return nil
+		return make([]pb.Entry, 0)
 	}
 
 	firstIndex := l.entries[0].Index
@@ -178,6 +178,9 @@ func (l *RaftLog) LastIndex() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
+	if i == 0 {
+		return 0, nil
+	}
 	if len(l.entries) > 0 {
 		firstIndex := l.entries[0].Index
 		if i >= firstIndex {
@@ -188,22 +191,19 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		}
 	}
 
-	// 2. 检查是否是 pendingSnapshot 的位置
+	// 2. if the index locate in pendingSnapshot
 	if l.pendingSnapshot != nil {
 		if i == l.pendingSnapshot.Metadata.Index {
 			return l.pendingSnapshot.Metadata.Term, nil
 		}
 	}
 
-	// 3. 都不在内存里，去 storage 查
-	// 注意：如果 i 已经被 compact 了，storage 会返回 ErrCompacted
-	// 如果 i 还没生成，storage 会返回 ErrUnavailable
+	// 3. check the index in the storage
 	term, err := l.storage.Term(i)
 	return term, err
 }
 
-// todo 还没看，有时间看看
-// append 追加新日志到 entries (可能会截断冲突的日志)
+// append append entries into the store
 func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 	if len(ents) == 0 {
 		return l.LastIndex()
@@ -211,7 +211,7 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 
 	after := ents[0].Index
 
-	// Safety Check: 不能修改已提交的日志
+	// Safety Check: can not change committed logEntries
 	if after <= l.committed {
 		panic("out of bound")
 	}
@@ -221,8 +221,7 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 	// 比如 firstIndex=100, after=102, 那么 offset = 102 - 100 = 2
 	if len(l.entries) > 0 {
 		firstIndex := l.entries[0].Index
-
-		// 截断逻辑 (Truncate)
+		//  Truncate logic:
 		// 如果 after 刚好接在最后一条后面，直接 append
 		// 如果 after 在中间，需要截断
 		if after > firstIndex {
@@ -232,7 +231,6 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 			// 保留 entries[:1] 即 [100]，扔掉 101, 102
 			if offset < uint64(len(l.entries)) {
 				l.entries = l.entries[:offset]
-
 				// 关键点：如果你截断了日志，stabled 指针可能也失效了
 				// 如果 stabled 指向了被截断的部分（比如 stabled=102），需要回退
 				if l.stabled >= after {
@@ -289,6 +287,39 @@ func (l *RaftLog) stableSnapTo(i uint64) {
 			l.stabled = i
 		}
 	}
+}
+
+// Entries returns a slice of log entries in the range [lo,hi).
+// MaxSize limits the total size of the log entries returned, but
+// Entries returns at least one entry if any.
+func (l *RaftLog) Entries(lo, hi uint64) ([]pb.Entry, error) {
+	// 1. 范围无效检查
+	if lo >= hi {
+		return nil, nil
+	}
+
+	// 2. 检查 entries 是否为空
+	if len(l.entries) == 0 {
+		return nil, nil
+	}
+
+	firstIndex := l.entries[0].Index
+
+	// 3. 检查 lo 是否已经被 Compact
+	if lo < firstIndex {
+		return nil, ErrCompacted
+	}
+
+	// 4. 检查 hi 是否越界
+	if hi > l.LastIndex()+1 {
+		// 理论上调用者应该保证不越界，但防御性编程 panic 一下也可以
+		// panic(fmt.Sprintf("entries hi(%d) out of bound lastindex(%d)", hi, l.LastIndex()))
+		// 或者这里简单截断到末尾
+		hi = l.LastIndex() + 1
+	}
+	// 5. 计算相对下标并切片
+	offset := lo - firstIndex
+	return l.entries[offset : offset+hi-lo], nil
 }
 
 // IsEmptySnapshot if the snapshot is an empty snapshot

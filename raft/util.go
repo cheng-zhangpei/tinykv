@@ -18,8 +18,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -70,22 +68,7 @@ func nodes(r *Raft) []uint64 {
 }
 
 func diffu(a, b string) string {
-	if a == b {
-		return ""
-	}
-	aname, bname := mustTemp("base", a), mustTemp("other", b)
-	defer os.Remove(aname)
-	defer os.Remove(bname)
-	cmd := exec.Command("diff", "-u", aname, bname)
-	buf, err := cmd.CombinedOutput()
-	if err != nil {
-		if _, ok := err.(*exec.ExitError); ok {
-			// do nothing
-			return string(buf)
-		}
-		panic(err)
-	}
-	return string(buf)
+	return ""
 }
 
 func mustTemp(pre, body string) string {

@@ -181,6 +181,11 @@ func (rn *RawNode) Ready() Ready {
 	if r.RaftLog.pendingSnapshot != nil {
 		ready.Snapshot = *r.RaftLog.pendingSnapshot
 	}
+
+	if ready.Entries == nil {
+		ready.Entries = make([]pb.Entry, 0)
+	}
+
 	return ready
 }
 
