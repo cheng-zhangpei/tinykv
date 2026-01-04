@@ -1,4 +1,4 @@
-## 1.关于rawNode为啥要写ready
+## go1.关于rawNode为啥要写ready
 
 **etcd/TinyKV 的设计哲学是：**
 		Raft 只是个大脑（纯内存逻辑），它没有手（不能写磁盘），也没有嘴（不能发消息）。我之前写raft的时候其实就是纯粹的大脑，没有任何的行动力。
@@ -179,3 +179,299 @@ lastIndex := r.RaftLog.LastIndex()
 
 ​	-> 所以说明，分布式系统分层非常重要，什么是原生接口，原生接口的功能是啥，如果调用路口太多有时候就会有地方没有更新到位。
 
+---
+
+## 对于RaftStore这一角色在全局的了解
+
+​		raftStore感觉是统领所有raft组的一个管家，raft模块是通过ready与advance向上层通知，ready:我的状态改变了哦，快点把我持久化一下。advance: 上面的模块告诉raft，你的状态持久化好了，可以修改状态（软硬）和指针了。
+
+​		raftStore的整体架构设计是Workers异步化，这是为了避免raftStore的主线程堵塞，可以将耗时操作异步化。具体的架构如下：
+
+```
+[ TinyKV Server ]
+      |
+      | (gRPC 请求: Put/Get/Snap)
+      v
+[ RaftStore (Manager) ] <---- 下面不同worker负责不同部分
+      |
+      +--- 路由 (Router): 根据 RegionID 找到对应的 Peer
+      |
+      +--- 驱动 (Ticker): 给所有 Peer 发 Tick 信号
+      |
+      v
+[ Peer (Worker) ]  <---- 每一个 Region 的代言人
+      |
+      +--- [ Raft Module ] (你写的 2A 代码)
+      |         ^
+      |         | (Input: Step)
+      |         | (Output: Ready)
+      |         v
+      +--- [ PeerStorage ] (你写的 2B 代码)
+      |         |
+      |         v
+      +--- [ BadgerDB ] (磁盘)
+```
+
+
+
+**RaftStore 的核心设计：Batch System (批处理)**
+
+- 它用**少量线程**（通常是 CPU 核数）来驱动**大量 Region**。
+- 它有一个 Loop，不断轮询：“Region 1 有消息吗？Region 2 有消息吗？”
+- 如果有，就拿出来执行 `Step()`，收集 `Ready`。
+- 然后把这一批 Ready 攒起来，**一次性**刷到磁盘（Write Batch），**一次性**发到网络。
+- **这叫 IO 合并**，是 TiKV 高性能的秘密。
+- 它负责心跳的驱动，由其统一触发心跳信号给所有的raft节点
+
+-----
+
+这里再将这个架构掰开来看：
+
+```
+RaftStore--->raft_worker--->peer_mesg_handler--->peer--->raftGroup->raft->状态变化
+													 ---> peerStore->db->状态持久化
+				
+```
+
+​		RaftStore下面的raft_worker负责详细的传递，本质其实就是不断读raftch这个通道并将数据分发到不同的region中，每一个region其实只要有一个rawnode接收信息就好了，这个peer其实是在raft组的基础上封装了一层的其他的组件，比如ticker就是在peer这层，还有peerStorage，一个peerStorage负责一个raft组的持久化操作。
+
+- 我后面看了一下TIKV的帖子，发现的确蕴含了很多的异步和同步的trade-off
+- 我看了一下真正的网络层是在peer_msg_handler里面，这个网络层的具体内容后续有时间还是要深挖一下的。
+- 我们在对ready的时候有一个比较有意思的细节就是我们会创建两个WriteBatch，在两个不同的引擎来存状态和事务，这样的设计的确是会存在不一致的问题但是，好像是为了权衡性能：
+
+> Raft Log (WAL) 和 KV Data (LSM-Tree) 的写入模式完全不同：
+>
+> - **Raft Log**: Append-only，顺序写，极快。
+> - **KV Data**: 随机写，可能有 Compaction，慢。
+>   如果不把它们分开（存到不同的 Badger 实例或 Column Family），KV 的慢写入会阻塞 Raft 的快写入，导致整个共识协议卡顿。
+
+
+
+---
+
+Snapshot 包含两部分：
+
+1. **Metadata**: `Index`, `Term`, `ConfState` (集群成员)。
+2. **Data**: 真实的 KV 数据 (Key-Value Pairs)。
+
+​		我们快照生成的逻辑其实是这样的，peer中的peerStorage中有一个Snapshot方法，这个方法就是用来检测快照生成的咋样的，因为快照生成的过程一定是需要与peer这个结构解耦的，不然就会卡死raft的运行。具体的工作是用region_worker来做的，`RegionWorker` 收到任务后，会在后台线程扫描 BadgerDB，生成 Snapshot，然后把结果塞回 `ch` (Notifier)，然后Snapshot再去这个ch中去取快照。
+
+----
+
+- 我们快照以及持久化其实单位都是peer（region）
+
+peerStorage是针对一个region的持久化操作。其实这样想也很正常，对于一个raft group不就是一个由共识算法联系起来的一个状态统一体吗？
+
+综上可以详细复盘一下整个peer中snapshot的调用链路：
+
+### A. 生成快照链路 (Create Snapshot)
+
+**场景**：Leader 或 Follower 发现自己的 Log 太长了（超过了 `RaftLogGcCountLimit`），需要 Compact。
+
+这前面还有一个场景：外部Store中的全局ticker发送数据到raftWorker的raftch通道，这个通道会接受下面这些信息：
+
+1. **Ticker (时钟)**: 会扔 `Msg{Type: MsgTypeTick}`。
+2. **Network (网络)**: 会扔 `Msg{Type: MsgTypeRaftMessage}` (收到别的节点消息)。
+3. **Client (客户端)**: 会扔 `Msg{Type: MsgTypeRaftCmd}` (Propose)。
+
+​		后面链接的peer_msg_handler本质就是一个消息接受处理的中转站，每一个peer都有一个handler，他用于接受raftWorker的tick用于驱动快照的形成，peer_msg_handler是会对raftch中的数据进行过滤只留下属于自己regionId的内容。所以这里其实是一个1对多的关系，只用若干线程，层层解耦，将计算下放。
+
+-----------------------
+
+
+
+1. **PeerMsgHandler (Tick)**: `onRaftGCLogTick` 定时检查日志长度。这个检查长度的代码是在peer_msg_handler中的
+2. **触发**: 发现太长 -> 发送 `CompactLogRequest` 给自己 (AdminRequest)。
+3. **Propose**: `proposeRaftCommand` -> Raft Log。（这个链路就是进入rawNode了，进入raft组了）
+
+--> **这中间就是raft的的过程， 接收/应用快照。 它不参与快照的生成**
+
+Raft 动作:
+
+- 这个 Request 只是一个普通的 Log Entry。Raft 把它 Append、Broadcast、Commit。这个时候修改了entries，就会生成ready往上汇报。
+- **注意**: 此时 Raft **没有调用 `handleSnapshot`**。**Apply**: `HandleRaftReady` 拿到了 `CompactLogRequest`。
+
+1. **Apply**: `HandleRaftReady` -> `processAdminRequest` -> `CompactLog`。
+
+2. PeerStorage: 调用ScheduleCompactLog
+
+   -> 删除旧日志。
+
+   - **关键点**: 这时并没有**生成**完整的 Snapshot 文件，只是截断了日志，修改了 `TruncatedState`。
+
+3. 真正的生成 (当有人要的时候，这个我们也成为lazy generation):
+
+   - **场景**: Leader 想发日志给 Follower，但发现日志被截断了 (`ErrCompacted`)。
+   - **动作**: Leader 调用 `r.sendSnapshot` -> `r.RaftLog.storage.Snapshot()`。
+   - **PeerStorage**: `Snapshot()` 被调用 -> 发送 `RegionTaskGen` 给 **RegionWorker**。
+   - **RegionWorker**: 扫描 BadgerDB -> 生成 `pb.Snapshot` -> 返回给 Leader。
+   - **Leader**: 把这个热乎的 Snapshot 封装进 `MsgSnapshot` 发给 Follower。
+
+### B. 应用快照链路 (Apply Snapshot) - 你刚才复盘的那条
+
+**场景**：Follower 落后太多，收到了 Leader 发来的 `MsgSnapshot`。
+
+1. **Leader**: 发送 `MsgSnapshot` (网络消息)。
+2. Follower (Raft):Step->handleSnapshot
+   - **动作**: 清空 Log，设置 `pendingSnapshot = snapshot`。
+3. **Follower (RawNode)**: `Ready()` 发现有 `pendingSnapshot`，打包吐出。
+4. **Follower (PeerMsgHandler)**: `HandleRaftReady` 收到 Ready。
+5. Follower (PeerStorage): 调用SaveReadyState----->ApplySnapshot
+   - **Meta**: 修改 `RaftState`, `TruncatedState` (持久化)。
+   - **Data**: 发送 `RegionTaskApply` 给 **RegionWorker** (异步写盘)。
+6. **Advance**: 通知 Raft 清除 `pendingSnapshot`。
+
+----
+
+在写raft层的snapshot中需要注意的点：
+
+- sendSnapshot
+
+   其实就是从PeerStorage里面调用Snapshot这个方法去通知RegionWorker干活
+
+​	拿到之后将快照丢给别的follower，但是，这里要注意修改leader去follower的感官，就是Progress中的Next指针要改一下，不然后面同步太麻烦了。
+
+- handleSnapshot
+
+​		其实先做校验，看看这个快照的index不会还不如我现在的日志新吧？如果更新就把现在raftLog中的指针全部都修改了。在更新指针之前还要becomeFollower一下，也就是重置一些状态，不然Vote之类的参数可能还是绑定的，会在后面出现一些奇奇怪怪的问题。核心就是要更新就更新彻底。
+
+----
+
+对于计时器，计时器是一个全局触发的tick，全局ticker的心脏是raftStore中tickerDriver
+
+1. **TickDriver (全局)**:
+
+   - 这是一个独立的 Goroutine。
+   - 它维护了一个大循环，或者维护了一个时间轮（Time Wheel）。
+
+   > 甚至这个位置还可以看到时间轮，这个难度真的很恐怖了
+
+   - 它每隔 100ms（`RaftBaseTickInterval`），就会醒一次。
+
+2. **分发 Tick**:
+
+   - TickDriver 醒来后，会遍历所有的 Region（或者通过某些机制知道哪些 Region 该 Tick 了）。
+   - 它向对应的 `raftWorker` 发送一个 `Msg{Type: MsgTypeTick, RegionID: ...}`。
+   - **关键点**：这个 Tick 消息也是通过 **`raftCh`** 扔进去的！和其他网络消息、客户端请求一样，排队等待处理。
+
+3. **raftWorker (处理)**:
+
+   - 从 `raftCh` 收到 `MsgTypeTick`。
+   - 找到对应的 `peerMsgHandler`。
+   - 调用 `d.onTick()`。
+
+4. **peerMsgHandler (响应)**:
+
+   - `d.onTick()` 调用 `d.RaftGroup.Tick()`。
+   - `Raft.tick()` -> `elapsed++` -> `MsgHup/MsgBeat`。
+
+-----
+
+对于整个流程深埋的网络线：
+
+#### 第一站：Raft 算法层 (raft.go)
+
+- **动作**: `r.sendAppend(to=B)`
+- **产物**: `pb.Message{Type: MsgAppend, To: B, Entries: ...}`
+- **位置**: 这个消息现在还在 `r.msgs` 这个内存切片里。
+
+#### 第二站：Ready 打包 (rawnode.go)
+
+- **动作**: `RawNode.Ready()`
+- **产物**: `Ready{Messages: [MsgAppend]}`
+- **位置**: 这个消息被打包在这个 Ready 结构体里，交给上层。
+
+#### 第三站：RaftStore 主循环 (peer_msg_handler.go)
+
+- **动作**: `d.Send(d.ctx.trans, rd.Messages)`
+- **关键点**: 这里是 Raft 世界和外界的**分界线**！
+- **代码**: `d.ctx.trans.Send(msg)`。
+- **Trans 是啥？** 它是 `Transport` 接口。在 TinyKV 里，它通常是一个 `RaftClient`。
+
+#### 第四站：Transport 层 (transport.go / server.go)
+
+- **动作**: `RaftClient.Send(msg)`
+- 转换: 这里发生了一次关键的封装！
+  - Raft 的 `pb.Message` 被塞进了一个更大的信封：**`RaftMessage`** (定义在 `raft_serverpb.proto`)。
+  - `RaftMessage` 包含了：`RegionID`, `FromPeer`, `ToPeer`, 以及最核心的 `Message` (刚才那个 Raft Msg)。
+- **发送**: 调用 gRPC 的 `Snapshot` 或 `Raft` 接口，真正通过 TCP 发给 Peer B 的 IP:Port。
+
+#### 第五站：Peer B 的 gRPC Server (server.go)
+
+- **动作**: `Raft(stream)`
+- **接收**: Server 收到 `RaftMessage`。
+- **分发**: 调用 `router.Send(regionID, msg)`。
+
+#### 第六站：Peer B 的 Router & Worker (raft_worker.go)
+
+- **动作**: Router 根据 `RegionID` 找到对应的 Worker。
+- **入队**: 把 `RaftMessage` 扔进 `raftCh`。
+- **Worker 线程**: 从 `raftCh` 取出消息。
+
+#### 第七站：Peer B 的 Handler (peer_msg_handler.go)
+
+- **动作**: `HandleMsg(msg)` -> `HandleRaftMessage`。
+- **解包**: 把 `RaftMessage` 里的 `pb.Message` 拿出来。
+- **投喂**: `d.RaftGroup.Step(msg)`。
+
+#### 终点站：Peer B 的 Raft (raft.go)
+
+- **动作**: `Step(msg)` -> `handleAppendEntries`。
+- **闭环**: Peer B 的 Raft 收到了这条日志！
+
+-----
+
+其实只有**两套**核心通讯机制交织在一起：
+
+1. **gRPC 网络通讯 (Node to Node)**:
+   - 负责在**不同机器**之间搬运数据。
+   - 载体：`RaftMessage`。
+   - 管道：`Server` -> `Transport` -> `Server`。
+2. **Go Channel 内部通讯 (Thread to Thread)**:
+   - 负责在**同一个进程内**的不同线程（Goroutine）之间搬运数据。
+   - 载体：`Msg` (包含 RaftMessage, Tick, Cmd)。
+   - 管道：`raftCh`, `regionSched`, `applySched`。
+
+----
+
+​		**1 个 Node = 1 个 TinyKV 进程 = 1 个 RaftStore = 多个 Peer (Regions)**。这个对应关系要搞清楚，其实这样看这个封装的架构真的无比复杂.........
+
+
+
+-----
+
+​		在peer_msg_handler中的proposeRaftCommand方法，这个方法的作用是下方我们Proposal的，也就是调用rawNode的propose，但是这个位置在不断的网络分区中，Proposal是会失败的，也就是刚刚propose下去就导致分区，propose失败，所以这个时候简单的propose就不行了，否则会导致propose驻留在队列中对后面的类型干扰。
+
+
+
+```go
+	if err := d.RaftGroup.Propose(data); err != nil {
+		if cb != nil {
+			// 移除刚刚添加的最后一个 proposal
+			d.proposals = d.proposals[:len(d.proposals)-1]
+			cb.Done(ErrResp(err))
+		}
+		return
+	}
+```
+
+​		所以这个位置要做一个截断，将最后的一个元素给截断掉。这个函数proposeRaftCommand也是由tick去驱动的，而真正append的操作是raft往上ready的内容
+
+----
+
+
+
+做存储开发，当你要更新两个非原子（不在同一个 Batch/DB）的状态时，永远要问自己：
+
+> **“如果写完第一个，还没写第二个就挂了，系统重启后能不能活？”**
+
+- **方案 A（旧）**：记了有数据，没记起点变了 -> **数据空洞（Panic）**。
+- **方案 B（新）**：记了起点变了，没记有数据 -> **数据丢失（Empty Log）**。
+
+-----
+
+
+
+
+
+所以可以看出这句话，系统的设计本质上就是一门艺术，看了TinyKV这个项目才会有深刻的感悟。

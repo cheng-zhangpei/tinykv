@@ -232,6 +232,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := progress.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	// corner case: when the follower lack too many entries that the leader`s entries was compacted
+	// the entries have been compact, we should send the snapshot to follower
 	if err != nil {
 		if errors.Is(err, ErrCompacted) {
 			// send the snapshot to let follower get the entries from snapshot
@@ -684,8 +685,28 @@ func (r *Raft) handleBeat(m pb.Message) {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
+	// follower should check the message
+	meta := m.Snapshot.Metadata
+	if m.Term < r.Term {
+		return
+	}
+	// check the committed pointer and the index of the snapshot
+	if m.Index < r.RaftLog.committed {
+		r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex(), 0)
+	}
+	// clear the log and entries
+	r.becomeFollower(m.Term, m.From)
 
-	// Your Code Here (2C).
+	// change the raftLog status
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	// all these pointer are the same, the entries of the snapshot are committed, applied and stabled
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.stabled = meta.Index
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.entries = make([]pb.Entry, 0)
+
+	r.sendAppendResponse(m.From, false, meta.Index, 0)
+	return
 }
 
 // -----------------------------------------tool----------------------------------------------
@@ -737,7 +758,26 @@ func (r *Raft) sendMsg(msg pb.Message) {
 	r.msgs = append(r.msgs, msg)
 }
 
-func (r *Raft) sendSnapshot(to uint64) {}
+// sendSnapshot 正式有follower要日志的时候才会生成快照，之前更新的只是截断的位置罢了
+func (r *Raft) sendSnapshot(to uint64) {
+	// 开始叫regionWorker干活了，快去生成快照
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	// 可能快照还在生成，就跳过就好了
+	if err != nil {
+		return
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.sendMsg(msg)
+	// 直接预先设置（虽然可能apply需要一些时间这里可能会引发回退）
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+
+}
 func (r *Raft) sendVoteResponse(to uint64, reject bool) {
 	lastIndex := r.RaftLog.LastIndex()
 	lastLogTerm, _ := r.RaftLog.Term(lastIndex)

@@ -151,6 +151,7 @@ func (ps *PeerStorage) FirstIndex() (uint64, error) {
 	return ps.truncatedIndex() + 1, nil
 }
 
+// Snapshot 生成快照
 func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 	var snapshot eraftpb.Snapshot
 	if ps.snapState.StateType == snap.SnapState_Generating {
@@ -307,11 +308,37 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+	for _, entry := range entries {
+		val, err := entry.Marshal()
+		key := meta.RaftLogKey(ps.region.Id, entry.Index)
+
+		if err != nil {
+			return err
+		}
+		raftWB.SetCF(engine_util.CfDefault, key, val)
+	}
+	// update ps.raftState,use the last entries to update the peerStorage`s status
+	// 其实我们raft模块启动的时候会往Storage里面拿数据，这里的持久化模块如果在内存中记录了最新的这条消息
+	// 那么就可以加速启动了
+	lastEntry := entries[len(entries)-1]
+	ps.raftState.LastIndex = lastEntry.Index
+	ps.raftState.LastTerm = lastEntry.Term
+	// 处理日志截断 (Truncate) - 如果 Append 覆盖了旧日志？
+	// 在 TinyKV 里，Append 主要是追加。如果发生覆盖（比如 Term 变了），
+	// 只要 ps.raftState.LastIndex 更新了，且新日志覆盖了旧 Key，
+	// BadgerDB 会自动处理 Value 的覆盖。
+	// 唯一的问题是：如果新日志比旧日志短？（Truncate 尾部）
+	// 比如原先有 1-100，现在覆盖成 1-90。
+	// 这时候 91-100 变成脏数据了。
+	// 但 raftWB 只能 Set/Delete。
+	// 通常 PeerStorage 不需要显式 Delete 尾部，因为 Raft 算法保证了 LastIndex 只会增加（或者通过 Snapshot 截断）。
+	// 只有在 Term 冲突回退时，可能会出现这种情况。
+	// 不过 2B 简单处理即可，直接 Set。
 	return nil
 }
-
-// Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
@@ -319,19 +346,87 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
-	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
-	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	// 1. 更新内存中的状态
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+
+	ps.region = snapData.Region
+
+	// 2. 清理旧数据 (关键防御措施)
+	// 这些函数会向 raftWB 和 kvWB 里写入 Delete 操作
+	// 确保旧的 Log 不会干扰新的 Log
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+	ps.clearExtraData(snapData.Region)
+
+	// 3. 持久化状态
+	// 更新 RegionInfo
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	// 更新 ApplyState
+	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	// 更新 RaftState (LastIndex)
+	stateVal, err := ps.raftState.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	// 注意：RaftState 存放在 RaftDB 的 Default CF
+	raftWB.SetCF(engine_util.CfDefault, meta.RaftStateKey(ps.region.Id), stateVal)
+	return &ApplySnapResult{
+		PrevRegion: nil,
+		Region:     snapData.Region,
+	}, nil
 }
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	// TiKV其实是用批处理的方式来提高性能，我先将Ready中的内容放到这个WriteBatch里面
+	wb := new(engine_util.WriteBatch)     // 装用于snapshot的存储
+	raftWB := new(engine_util.WriteBatch) // raft状态的落盘
+
+	var snapResult *ApplySnapResult
+	if !raft.IsEmptySnapshot(&ready.Snapshot) {
+		var err error
+		// ApplySnapshot 会修改 ps.raftState 和 ps.applyState，并处理数据
+		// 2C 内容，暂时只需调用它，具体实现后面填
+		snapResult, err = ps.ApplySnapshot(&ready.Snapshot, wb, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(ready.Entries) > 0 {
+		// 如果有Entries就放到WriteBatch里面
+		if err := ps.Append(ready.Entries, raftWB); err != nil {
+			return nil, err
+		}
+	}
+	// 持久化HardState
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+		if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+			return nil, err
+		}
+	}
+	// 写盘,只有在raft的状态持久化之后才能写盘
+	if wb.Len() > 0 {
+		if err := wb.WriteToDB(ps.Engines.Kv); err != nil {
+			return nil, err
+		}
+	}
+	// 再将raft的数据写盘
+	if raftWB.Len() > 0 {
+		if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+			return nil, err
+		}
+	}
+
+	return snapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {
@@ -344,4 +439,7 @@ func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
 		StartKey: start,
 		EndKey:   end,
 	}
+}
+func (ps *PeerStorage) SetAppliedIndex(index uint64) {
+	ps.applyState.AppliedIndex = index
 }
