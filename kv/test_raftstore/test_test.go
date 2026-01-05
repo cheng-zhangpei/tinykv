@@ -408,10 +408,10 @@ func TestManyPartitionsManyClients2B(t *testing.T) {
 	GenericTest(t, "2B", 5, false, false, true, -1, false, false)
 }
 
-//func TestPersistOneClient2B(t *testing.T) {
-//	// Test: restarts, one client (2B) ...
-//	GenericTest(t, "2B", 1, false, true, false, -1, false, false)
-//}
+func TestPersistOneClient2B(t *testing.T) {
+	// Test: restarts, one client (2B) ...
+	GenericTest(t, "2B", 1, false, true, false, -1, false, false)
+}
 
 func TestPersistConcurrent2B(t *testing.T) {
 	// Test: restarts, many clients (2B) ...

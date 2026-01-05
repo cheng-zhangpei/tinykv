@@ -455,7 +455,7 @@ Raft 动作:
 	}
 ```
 
-​		所以这个位置要做一个截断，将最后的一个元素给截断掉。这个函数proposeRaftCommand也是由tick去驱动的，而真正append的操作是raft往上ready的内容
+​		所以这个位置要做一个截断，将最后的一个元素给截断掉。这个函数proposeRaftCommand也是由tick去驱动的，而真正append的操作是raft往上ready的内容。
 
 ----
 

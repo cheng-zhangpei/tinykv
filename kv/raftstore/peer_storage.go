@@ -48,6 +48,8 @@ type PeerStorage struct {
 	Engines *engine_util.Engines
 	// Tag used for logging
 	Tag string
+	// startKey array (only for test)
+	startKeys [][]byte
 }
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
@@ -72,6 +74,7 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 		raftState:   raftState,
 		applyState:  applyState,
 		regionSched: regionSched,
+		startKeys:   make([][]byte, 0),
 	}, nil
 }
 
@@ -85,47 +88,83 @@ func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, err
 	}
 	return *raftState.HardState, util.ConfStateFromRegion(ps.region), nil
 }
-
 func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
+	// 1. 范围检查 (Range Check)
 	if err := ps.checkRange(low, high); err != nil || low == high {
 		return nil, err
 	}
+
 	buf := make([]eraftpb.Entry, 0, high-low)
 	nextIndex := low
+
+	// 2. 开启事务 (Transaction)
 	txn := ps.Engines.Raft.NewTransaction(false)
 	defer txn.Discard()
+
+	// 3. 构造 Key (Construct Keys)
 	startKey := meta.RaftLogKey(ps.region.Id, low)
 	endKey := meta.RaftLogKey(ps.region.Id, high)
+
+	// 4. 构造迭代器 (Iterator)
 	iter := txn.NewIterator(badger.DefaultIteratorOptions)
 	defer iter.Close()
-	for iter.Seek(startKey); iter.Valid(); iter.Next() {
+
+	// 【关键】处理 CF 前缀 (Prefix Handling)
+	// BadgerDB 的 CF 其实就是 Key 前缀。
+	// engine_util.CfDefault -> "default"
+	// 实际前缀 -> "default_"
+	// 我们必须 Seek 这个带前缀的 Key。
+	prefixStr := engine_util.CfDefault + "_"
+	prefix := []byte(prefixStr)
+
+	seekKey := append([]byte{}, prefix...) // copy
+	seekKey = append(seekKey, startKey...)
+
+	for iter.Seek(seekKey); iter.Valid(); iter.Next() {
 		item := iter.Item()
-		if bytes.Compare(item.Key(), endKey) >= 0 {
+
+		// 拿到原始 Key (Raw Key with Prefix)
+		rawKey := item.Key()
+
+		// 检查是否跑出了 Default CF
+		if !bytes.HasPrefix(rawKey, prefix) {
 			break
 		}
+
+		// 去掉前缀，拿到真正的业务 Key (Real Key)
+		realKey := rawKey[len(prefix):]
+
+		// 检查是否超过了 endKey (high)
+		if bytes.Compare(realKey, endKey) >= 0 {
+			break
+		}
+
 		val, err := item.Value()
 		if err != nil {
 			return nil, err
 		}
+
 		var entry eraftpb.Entry
 		if err = entry.Unmarshal(val); err != nil {
 			return nil, err
 		}
-		// May meet gap or has been compacted.
+
+		// 连续性检查 (Gap Check)
 		if entry.Index != nextIndex {
 			break
 		}
 		nextIndex++
 		buf = append(buf, entry)
 	}
-	// If we get the correct number of entries, returns.
+
+	// 5. 最终校验 (Final Verification)
 	if len(buf) == int(high-low) {
 		return buf, nil
 	}
-	// Here means we don't fetch enough entries.
+
+	// 如果读不够，说明有数据丢失或不一致
 	return nil, raft.ErrUnavailable
 }
-
 func (ps *PeerStorage) Term(idx uint64) (uint64, error) {
 	if idx == ps.truncatedIndex() {
 		return ps.truncatedTerm(), nil
@@ -307,36 +346,90 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
+//
+//	func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
+//		if len(entries) == 0 {
+//			return nil
+//		}
+//		for _, entry := range entries {
+//			val, err := entry.Marshal()
+//			key := meta.RaftLogKey(ps.region.Id, entry.Index)
+//
+//			if err != nil {
+//				return err
+//			}
+//			raftWB.SetCF(engine_util.CfDefault, key, val)
+//		}
+//		// update ps.raftState,use the last entries to update the peerStorage`s status
+//		// 其实我们raft模块启动的时候会往Storage里面拿数据，这里的持久化模块如果在内存中记录了最新的这条消息
+//		// 那么就可以加速启动了
+//		lastEntry := entries[len(entries)-1]
+//		ps.raftState.LastIndex = lastEntry.Index
+//		ps.raftState.LastTerm = lastEntry.Term
+//		// 处理日志截断 (Truncate) - 如果 Append 覆盖了旧日志？
+//		// 在 TinyKV 里，Append 主要是追加。如果发生覆盖（比如 Term 变了），
+//		// 只要 ps.raftState.LastIndex 更新了，且新日志覆盖了旧 Key，
+//		// BadgerDB 会自动处理 Value 的覆盖。
+//		// 唯一的问题是：如果新日志比旧日志短？（Truncate 尾部）
+//		// 比如原先有 1-100，现在覆盖成 1-90。
+//		// 这时候 91-100 变成脏数据了。
+//		// 但 raftWB 只能 Set/Delete。
+//		// 通常 PeerStorage 不需要显式 Delete 尾部，因为 Raft 算法保证了 LastIndex 只会增加（或者通过 Snapshot 截断）。
+//		// 只有在 Term 冲突回退时，可能会出现这种情况。
+//		// 不过 2B 简单处理即可，直接 Set。
+//		return nil
+//	}
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	for _, entry := range entries {
-		val, err := entry.Marshal()
-		key := meta.RaftLogKey(ps.region.Id, entry.Index)
 
+	// 1. 记录这次 Append 涉及的最大 Index，用于更新 LastIndex
+	// 注意：不能简单取 entries[len-1]，因为可能所有 entries 都被 truncate 过滤掉了
+	lastIndex := ps.raftState.LastIndex
+	lastTerm := ps.raftState.LastTerm
+
+	hasValidEntry := false
+	for _, entry := range entries {
+		// 截断保护
+		// 如果这条日志的 Index 小于等于当前的 TruncatedIndex，说明它是快照之前的老黄历了。
+		// 绝对不能写进去，否则会把 Snapshot 的成果搞乱，甚至覆盖掉元数据。
+		if entry.Index <= ps.truncatedIndex() {
+			continue
+		}
+
+		// 序列化日志
+		val, err := entry.Marshal()
 		if err != nil {
 			return err
 		}
+
+		// 生成 Key: 格式通常是 z{regionID}_{index}
+		key := meta.RaftLogKey(ps.region.Id, entry.Index)
+		ps.startKeys = append(ps.startKeys, key)
+
+		// 写入 Batch (注意是 Default CF)
 		raftWB.SetCF(engine_util.CfDefault, key, val)
+		// 记录有效的最后一条日志信息
+		lastIndex = entry.Index
+		lastTerm = entry.Term
+		hasValidEntry = true
+
 	}
-	// update ps.raftState,use the last entries to update the peerStorage`s status
-	// 其实我们raft模块启动的时候会往Storage里面拿数据，这里的持久化模块如果在内存中记录了最新的这条消息
-	// 那么就可以加速启动了
-	lastEntry := entries[len(entries)-1]
-	ps.raftState.LastIndex = lastEntry.Index
-	ps.raftState.LastTerm = lastEntry.Term
-	// 处理日志截断 (Truncate) - 如果 Append 覆盖了旧日志？
-	// 在 TinyKV 里，Append 主要是追加。如果发生覆盖（比如 Term 变了），
-	// 只要 ps.raftState.LastIndex 更新了，且新日志覆盖了旧 Key，
-	// BadgerDB 会自动处理 Value 的覆盖。
-	// 唯一的问题是：如果新日志比旧日志短？（Truncate 尾部）
-	// 比如原先有 1-100，现在覆盖成 1-90。
-	// 这时候 91-100 变成脏数据了。
-	// 但 raftWB 只能 Set/Delete。
-	// 通常 PeerStorage 不需要显式 Delete 尾部，因为 Raft 算法保证了 LastIndex 只会增加（或者通过 Snapshot 截断）。
-	// 只有在 Term 冲突回退时，可能会出现这种情况。
-	// 不过 2B 简单处理即可，直接 Set。
+
+	// 【防守 2】更新内存状态 (RaftState)
+	// 只有当不仅写入了数据，而且新的 Index 确实比旧的 LastIndex 大（或者因为 Raft 语义是覆盖，所以直接更新）时才更新。
+	// 在 Raft 中，Append 意味着“从这儿开始，后面的以我为准”。
+	// 所以只要有 Valid Entry，最后一条就是最新的 LastIndex。
+	if hasValidEntry {
+		ps.raftState.LastIndex = lastIndex
+		ps.raftState.LastTerm = lastTerm
+	}
+
+	// 注意：这里我们只更新了内存里的 ps.raftState。
+	// 持久化 ps.raftState 的工作交给了 SaveReadyState 函数最后一步统一处理。
+	// 这样保证了 Log 和 State 的原子性。
+
 	return nil
 }
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
@@ -385,45 +478,57 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// TiKV其实是用批处理的方式来提高性能，我先将Ready中的内容放到这个WriteBatch里面
-	wb := new(engine_util.WriteBatch)     // 装用于snapshot的存储
-	raftWB := new(engine_util.WriteBatch) // raft状态的落盘
+	wb := new(engine_util.WriteBatch)     // KvDB (Snapshot/TruncatedIndex)
+	raftWB := new(engine_util.WriteBatch) // RaftDB (Log/RaftState)
 
 	var snapResult *ApplySnapResult
 	if !raft.IsEmptySnapshot(&ready.Snapshot) {
 		var err error
-		// ApplySnapshot 会修改 ps.raftState 和 ps.applyState，并处理数据
-		// 2C 内容，暂时只需调用它，具体实现后面填
+		// ApplySnapshot 内部已经把状态更新并放入 batch 了
 		snapResult, err = ps.ApplySnapshot(&ready.Snapshot, wb, raftWB)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	// 1. 处理 Append (更新内存 LastIndex，写入日志到 raftWB)
 	if len(ready.Entries) > 0 {
-		// 如果有Entries就放到WriteBatch里面
 		if err := ps.Append(ready.Entries, raftWB); err != nil {
 			return nil, err
 		}
 	}
-	// 持久化HardState
+
+	// 2. 处理 HardState (更新内存 HardState)
 	if !raft.IsEmptyHardState(ready.HardState) {
+		// 更新hardState
 		ps.raftState.HardState = &ready.HardState
+	}
+
+	// 3. 【关键修正】持久化 RaftState (LastIndex + HardState)
+	// 只要有日志追加，或者 HardState 变了，都要保存！
+	// 哪怕 HardState 没变，LastIndex 变了也得保存！
+	if len(ready.Entries) > 0 || !raft.IsEmptyHardState(ready.HardState) {
 		if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
 			return nil, err
 		}
 	}
-	// 写盘,只有在raft的状态持久化之后才能写盘
+
+	// 4. 写盘 (先 KV 后 Raft，保证 Crash Consistency)
 	if wb.Len() > 0 {
 		if err := wb.WriteToDB(ps.Engines.Kv); err != nil {
 			return nil, err
 		}
 	}
-	// 再将raft的数据写盘
 	if raftWB.Len() > 0 {
+		// first key:
+
 		if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 			return nil, err
 		}
+		//if len(ps.startKeys) == 1 {
+		//	log.Infof("raft states: firstIndex:%d lastIndex:%d", ps.truncatedIndex()+1, ps.raftState.LastIndex)
+		//	log.Infof("(entries persist)firstKey: %v\n", ps.startKeys[0])
+		//}
 	}
 
 	return snapResult, nil

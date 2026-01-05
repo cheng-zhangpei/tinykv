@@ -659,11 +659,6 @@ func (d *peerMsgHandler) processCommittedEntry(entry *eraftpb.Entry, kvWB *engin
 		return
 	}
 
-	msg = &raft_cmdpb.RaftCmdRequest{}
-	if err := msg.Unmarshal(entry.Data); err != nil {
-		return
-	}
-
 	// 1. 【统一检查】RegionEpoch
 	// 无论是普通请求还是 Admin 请求，首先检查版本号
 	// 如果不对，直接回调错误，后续所有 Put/Get/Snap 统统不执行

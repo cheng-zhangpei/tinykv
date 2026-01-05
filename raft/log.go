@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -60,6 +63,7 @@ func newLog(storage Storage) *RaftLog {
 	// 2. 加载 entries
 	// 注意：firstIndex 可能比 lastIndex 大（比如 Storage 为空），这时候 entries 应该是 nil
 	// Storage.Entries(first, last+1)
+	log.Infof("start recover the log, trying to move [%d,%d] in the store ->  log in memory", firstIndex, lastIndex)
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
 		panic(err)
