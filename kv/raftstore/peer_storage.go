@@ -48,8 +48,6 @@ type PeerStorage struct {
 	Engines *engine_util.Engines
 	// Tag used for logging
 	Tag string
-	// startKey array (only for test)
-	startKeys [][]byte
 }
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
@@ -74,7 +72,6 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 		raftState:   raftState,
 		applyState:  applyState,
 		regionSched: regionSched,
-		startKeys:   make([][]byte, 0),
 	}, nil
 }
 
@@ -406,7 +403,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 		// 生成 Key: 格式通常是 z{regionID}_{index}
 		key := meta.RaftLogKey(ps.region.Id, entry.Index)
-		ps.startKeys = append(ps.startKeys, key)
 
 		// 写入 Batch (注意是 Default CF)
 		raftWB.SetCF(engine_util.CfDefault, key, val)

@@ -112,7 +112,7 @@ To make informed decisions, the Scheduler should have some information about the
 
 Meanwhile, the Scheduler checks region information periodically to find whether there is an imbalance in our TinyKV cluster. For example, if any store contains too many regions, regions should be moved to other stores from it. These commands will be picked up as the response for corresponding regions’ heartbeat requests.
 
-In this part, you will need to implement the above two functions for Scheduler. Follow our guide and framework, and it won’t be too difficult.
+In this part, you will need to implement the above two functions for Scheduler. Follow our guide and framework, and it won’t be too difficult.**(所以这里我们需要做一些有关于调度器的工作了)**
 
 ### The Code
 

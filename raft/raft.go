@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	_ "log"
 	"math/rand"
@@ -321,7 +322,7 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.Lead = r.id
 	r.heartbeatElapsed = 0
-
+	r.leadTransferee = None
 	for peer := range r.Prs {
 		r.Prs[peer].Next = r.RaftLog.LastIndex() + 1
 		r.Prs[peer].Match = 0
@@ -340,8 +341,16 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// if m.Term > r.Term no matter which state, the node should become the follower
+	if m.MsgType == pb.MessageType_MsgTimeoutNow {
+		log.Infof("%d received timeout now from %d", r.id, m.From) // 看看收没收到
+	}
 	if m.Term > r.Term {
-		r.becomeFollower(m.Term, None)
+		r.leadTransferee = None // 如果正在 Transfer，Term 变了就终止
+		r.Term = m.Term
+		r.Vote = None
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, None)
+		}
 	}
 	switch r.State {
 	case StateFollower:
@@ -356,13 +365,26 @@ func (r *Raft) Step(m pb.Message) error {
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
-
-	// Your Code Here (3A).
+	// 1. 幂等性检查：如果已经在集群里了，直接忽略
+	if _, ok := r.Prs[id]; ok {
+		return
+	}
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  1,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
-	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		return
+	}
+	delete(r.Prs, id)
+	// 重新计算 Commit: 因为删除节点所以会导致原来committed仲裁结果不一样，所以这里需要重新计算一次
+	if r.State == StateLeader {
+		r.maybeCommit()
+	}
 }
 
 // ------------------------------------------tick------------------------------------------
@@ -417,6 +439,9 @@ func (r *Raft) stepLeader(m pb.Message) {
 		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.sendLeaderTransfer(m)
+
 	}
 }
 
@@ -437,6 +462,11 @@ func (r *Raft) stepCandidate(m pb.Message) {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.sendMsg(m)
+		}
 	}
 
 }
@@ -453,6 +483,13 @@ func (r *Raft) stepFollower(m pb.Message) {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.sendMsg(m)
+		}
+	case pb.MessageType_MsgTimeoutNow:
+		r.handleTimeoutNow(m)
 	}
 }
 
@@ -460,7 +497,10 @@ func (r *Raft) stepFollower(m pb.Message) {
 // handleVoteRequest follower and candidate handle vote request
 func (r *Raft) handleVoteRequest(m pb.Message) {
 	// 0. Term 检查 (Safety)
+	//log.Infof("%d handle vote from %d term %d (my term %d)", r.id, m.From, m.Term, r.Term)
+
 	if r.State == StateLeader {
+		// 对比任期
 		r.sendVoteResponse(m.From, true)
 		return
 	}
@@ -589,6 +629,7 @@ func (r *Raft) handleAppendLogEntryResponse(m pb.Message) {
 			r.Prs[m.From].Next = 1
 		}
 		r.sendAppend(m.From)
+
 	}
 
 	if m.Index > r.Prs[m.From].Match {
@@ -598,11 +639,19 @@ func (r *Raft) handleAppendLogEntryResponse(m pb.Message) {
 			r.bcastAppend()
 		}
 	}
+	//log.Infof("(handleEntriesResponse)Prs[transferee].Match=%d  r.RaftLog.LastIndex()= %d", r.Prs[m.From].Match, r.RaftLog.LastIndex()) // 看看发没发
+	if r.leadTransferee == m.From && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(m.From)
+	}
 }
 
 // handlePropose trigger the AppendLogEntries
 func (r *Raft) handlePropose(m pb.Message) {
 	if r.State != StateLeader {
+		return
+	}
+	// leader is transferring the leadership
+	if r.leadTransferee != None {
 		return
 	}
 	// todo We pick out the confChange message,we should handle it separately
@@ -611,10 +660,24 @@ func (r *Raft) handlePropose(m pb.Message) {
 		ent.Term = r.Term
 		ent.Index = lastIndex + uint64(i) + 1
 		if ent.EntryType == pb.EntryType_EntryConfChange {
-			// 如果已有 PendingConfIndex，拒绝新的
+			/*
+				Propose对ConfChange Entry的处理：
+				1. 如果PendingConfIndex > applied说明我现在收到ConfChange，之前还有一个正在change的config
+				这个时候不能去进行configChange，同时只能进行一个ConfigChange，因为担心这个change生效会影响之前的change
+				2. 这里有一个日志的截断，因为这个config没有生效，这个config之后的entries默认是面向新的日志
+			*/
 			if r.PendingConfIndex > r.RaftLog.applied {
-				// 拒绝: r.msgs = append(r.msgs, pb.Message{To: m.From, Type: pb.MessageType_MsgPropose, Reject: true})
-				// 不过简单起见，2B 先不管 ConfChange
+				log.Infof("reject conf change because pending conf index %d > applied %d",
+					r.PendingConfIndex, r.RaftLog.applied)
+				m.Entries = m.Entries[:i]
+				r.RaftLog.append(m.Entries...)
+				r.Prs[r.id].Match = r.RaftLog.LastIndex()
+				r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+				r.bcastAppend()
+				if len(r.Prs) == 1 {
+					r.RaftLog.committed = r.Prs[r.id].Match
+				}
+				return
 			}
 			r.PendingConfIndex = ent.Index
 		}
@@ -707,6 +770,14 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 
 	r.sendAppendResponse(m.From, false, meta.Index, 0)
 	return
+}
+
+func (r *Raft) handleTimeoutNow(m pb.Message) {
+	// corner case: the node is not in the region
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 }
 
 // -----------------------------------------tool----------------------------------------------
@@ -836,4 +907,36 @@ func (r *Raft) maybeCommit() bool {
 	}
 	//log.Printf("leader commit update %d", r.RaftLog.committed)
 	return false
+}
+
+// sendLeaderTransfer leader receive the transfer info from the Step()
+func (r *Raft) sendLeaderTransfer(m pb.Message) {
+	// 1. info check
+
+	transferee := m.From
+	if transferee == r.id {
+		return
+	}
+
+	if _, ok := r.Prs[transferee]; !ok {
+		return
+	}
+	r.leadTransferee = transferee
+	// 2. compare the log between the leader and transferee
+	//log.Infof("Prs[transferee].Match=%d  r.RaftLog.LastIndex()= %d", r.Prs[transferee].Match, r.RaftLog.LastIndex()) // 看看发没发
+	if r.Prs[transferee].Match == r.RaftLog.LastIndex() {
+		//log.Infof("%d send timeout now to %d", r.id, transferee) // 看看发没发
+		r.sendTimeoutNow(transferee)
+	} else {
+		r.sendAppend(transferee)
+	}
+}
+
+// sendTimeoutNow inform the follower to become the leader
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.sendMsg(pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		To:      to,
+		From:    r.id,
+	})
 }

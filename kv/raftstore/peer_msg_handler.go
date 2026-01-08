@@ -148,19 +148,77 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	// cb是一个回调的通知，本身是绑定了一个通道，只有调用Done方法时候才会回调通知Server已经结束了，Server不能一直等
+	// 1. 预检查 (Leader? Term? StoreID?)
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
-	// 序列化请求
+
+	// 2. 【关键新增】拦截特殊 Admin Request
+	if msg.AdminRequest != nil {
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			// 直接执行转让，不走日志
+			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+			// 立即回复成功
+			cb.Done(&raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				AdminResponse: &raft_cmdpb.AdminResponse{
+					CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+					TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+				},
+			})
+			return // 结束，不往下走了
+
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			// 转换为 ConfChange 日志
+			changePeer := msg.AdminRequest.ChangePeer
+			cc := eraftpb.ConfChange{
+				ChangeType: changePeer.ChangeType,
+				NodeId:     changePeer.Peer.Id,
+				Context:    nil,
+			}
+			// 序列化 Context
+			if changePeer.Peer != nil {
+				data, err := msg.Marshal() // 把整个 RaftCmdRequest 序列化进去
+				if err != nil {
+					cb.Done(ErrResp(err))
+					return
+				}
+				cc.Context = data
+			}
+
+			// 发起 ProposeConfChange
+			if err := d.RaftGroup.ProposeConfChange(cc); err != nil {
+				cb.Done(ErrResp(err))
+				return
+			}
+
+			// 绑定 Callback (ConfChange 也是一条日志，有 Index)
+			// 注意：ProposeConfChange 内部已经追加了日志，所以 LastIndex 已经是最新的了
+			index := d.RaftGroup.Raft.RaftLog.LastIndex()
+			term := d.RaftGroup.Raft.Term
+
+			if cb != nil {
+				d.proposals = append(d.proposals, &proposal{
+					index: index,
+					term:  term,
+					cb:    cb,
+				})
+			}
+			return // 结束，ConfChange 已经处理完了
+		}
+	}
+
+	// 3. 普通请求 (Put/Delete/Compact/Split) 继续往下走
 	data, err := msg.Marshal()
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
-	// 2. 绑定回调 (Callback)
+
+	// 绑定回调
 	index := d.RaftGroup.Raft.RaftLog.LastIndex() + 1
 	term := d.RaftGroup.Raft.Term
 
@@ -171,11 +229,10 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			cb:    cb,
 		})
 	}
-	// we can not do any persist operation here,the persist operation should be wrapped in Ready() of rawNode
 
 	if err := d.RaftGroup.Propose(data); err != nil {
 		if cb != nil {
-			// 移除刚刚添加的最后一个 proposal
+			// 回滚队列
 			d.proposals = d.proposals[:len(d.proposals)-1]
 			cb.Done(ErrResp(err))
 		}
@@ -641,6 +698,13 @@ func newCompactLogRequest(regionID uint64, peer *metapb.Peer, compactIndex, comp
 }
 func (d *peerMsgHandler) processCommittedEntry(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
 	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		cc := &eraftpb.ConfChange{}
+		if err := cc.Unmarshal(entry.Data); err != nil {
+			log.Errorf("%v failed to unmarshal conf change: %v", d.Tag, err)
+			return
+		}
+		// 调用处理函数 (修改 Region 元数据，回调 Raft)
+		d.processConfChange(entry, cc, kvWB)
 		return
 	}
 
@@ -668,7 +732,6 @@ func (d *peerMsgHandler) processCommittedEntry(entry *eraftpb.Entry, kvWB *engin
 	}
 	var resp *raft_cmdpb.RaftCmdResponse
 
-	// 2. 【分流处理】执行业务逻辑
 	if msg.AdminRequest != nil {
 		resp = d.processAdminRequest(msg.AdminRequest, kvWB)
 	} else if len(msg.Requests) > 0 {
@@ -723,8 +786,64 @@ func (d *peerMsgHandler) processRequests(msg *raft_cmdpb.RaftCmdRequest, kvWB *e
 	return resp
 }
 
+// 新增：处理 ConfChange 的专用函数
+func (d *peerMsgHandler) processConfChange(entry *eraftpb.Entry, cc *eraftpb.ConfChange, kvWB *engine_util.WriteBatch) {
+	// 1. 调用 RaftGroup 的 ApplyConfChange (通知 Raft 内核)
+	// 这会更新 Raft 内存里的 Prs，并重置 PendingConfIndex
+	_ = d.RaftGroup.ApplyConfChange(*cc)
+	// 2. 解析 Context 获取 Peer 信息
+	var msg raft_cmdpb.RaftCmdRequest
+	if err := msg.Unmarshal(cc.Context); err != nil {
+		// 如果 Context 为空或解析失败，说明可能只是为了测试或者某种特殊情况
+		// 只要不影响 Raft 核心逻辑就行
+	}
+	// 3. 修改 Region 元数据
+	region := d.Region()
+	switch cc.ChangeType {
+	case eraftpb.ConfChangeType_AddNode:
+		if util.FindPeer(region, cc.NodeId) == nil {
+			// 从 Context 里拿到完整的 Peer 信息 (StoreId 等)
+			// 注意：这里需要确保 Propose 的时候把 ChangePeerRequest 塞进了 cc.Context
+			req := msg.AdminRequest.ChangePeer
+			region.Peers = append(region.Peers, req.Peer)
+			log.Infof("%v add peer %v", d.Tag, req.Peer)
+		}
+	case eraftpb.ConfChangeType_RemoveNode:
+		// 如果删的是自己，准备自杀
+		if cc.NodeId == d.PeerId() {
+			d.destroyPeer()
+			return // 自杀了就不用往下执行了
+		}
+		// 从 Peers 列表里移除
+		if util.FindPeer(region, cc.NodeId) != nil {
+			util.RemovePeer(region, cc.NodeId)
+			log.Infof("%v remove peer %v", d.Tag, cc.NodeId)
+		}
+	}
+	// 4. 更新 ConfVer记录版本号并持久化
+	region.RegionEpoch.ConfVer++
+	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+
+	// 5. 更新 StoreMeta 里的 Region 缓存,这里就是globalContext中的值
+	// 因为 d.Region() 返回的是缓存的引用，上面修改 region 其实已经改了缓存
+	// 但为了线程安全，最好加锁或者重新 Set 一下
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regions[d.regionId] = region
+	d.ctx.storeMeta.Unlock()
+
+	// 6. 别忘了通知 Callback！(虽然 AdminRequest.ChangePeer 是空的 Response)
+	// ProposeConfChange 的时候也挂了 Callback
+	d.handleCallback(entry.Index, entry.Term, &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: region},
+			CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+		},
+	})
+}
+
 // processAdminRequest 处理 Split/Compact
-// 修改函数签名，增加返回值
+// 注意：TransferLeader 和 ChangePeer 不会走到这里！
 func (d *peerMsgHandler) processAdminRequest(req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch) *raft_cmdpb.RaftCmdResponse {
 	reqResp := &raft_cmdpb.AdminResponse{
 		CmdType: req.CmdType,
@@ -741,13 +860,24 @@ func (d *peerMsgHandler) processAdminRequest(req *raft_cmdpb.AdminRequest, kvWB 
 			// 持久化 ApplyState
 			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		}
-		// 构造 CompactLogResponse (内容其实是空的，主要为了告诉 Client 成功了)
 		reqResp.CompactLog = &raft_cmdpb.CompactLogResponse{}
 
 	case raft_cmdpb.AdminCmdType_Split:
-		// todo Lab 3B 会填这里
+		split := req.Split
+		// 检查一下worker生成的 splitKey是否还在
+		if err := util.CheckKeyInRegion(split.SplitKey, d.Region()); err != nil {
+			return ErrResp(err)
+		}
+		d.onRegionSplit(split, kvWB)
+		// 这里我有个疑问，这个findSiblingRegion是如何将这个region分裂出来的内容拿出来的
+		reqResp.Split = &raft_cmdpb.SplitResponse{
+			Regions: []*metapb.Region{d.Region(), d.findSiblingRegion()},
+			// findSiblingRegion 是那个新分裂出来的 Region，
+			// 但 onRegionSplit 还没执行完可能拿不到？
+			// 或者简单点，onRegionSplit 返回新 Region，或者这里先留空，Client 会自己重试
+		}
 	}
-	// 统一构造返回结构
+
 	return &raft_cmdpb.RaftCmdResponse{
 		Header:        &raft_cmdpb.RaftResponseHeader{},
 		AdminResponse: reqResp,
@@ -817,4 +947,59 @@ func (d *peerMsgHandler) ErrResp(err error) *raft_cmdpb.RaftCmdResponse {
 		},
 	}
 	return resp
+}
+
+// onRegionSplit 这个函数是用于处理Region分裂的主要的函数
+func (d *peerMsgHandler) onRegionSplit(split *raft_cmdpb.SplitRequest, kvWB *engine_util.WriteBatch) {
+	// 先复制一些参数到新的region里面
+	newRegion := &metapb.Region{
+		Id:       split.NewRegionId,
+		StartKey: split.SplitKey,
+		EndKey:   d.Region().EndKey,
+		RegionEpoch: &metapb.RegionEpoch{
+			ConfVer: d.Region().RegionEpoch.ConfVer, // 继承 ConfVer
+			Version: d.Region().RegionEpoch.Version, // 继承 Version (稍后统一 +1)
+		},
+		Peers: make([]*metapb.Peer, 0),
+	}
+	// 将自己的peer复制一下
+	for i, peer := range d.Region().Peers {
+		newRegion.Peers = append(newRegion.Peers, &metapb.Peer{
+			Id:      split.NewPeerIds[i],
+			StoreId: peer.StoreId,
+		})
+	}
+	// 2. 修改老 Region (Left Part)
+	d.Region().EndKey = split.SplitKey
+	d.Region().RegionEpoch.Version++ // 老 Region 版本号 +1
+	newRegion.RegionEpoch.Version++  // 新 Region 版本号 +1 (和老的一样)
+	// 3. 持久化 (Meta 信息)
+	// 同时保存两个 Region 的状态，保证原子性
+	meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+	// 4、更新路由表
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regions[d.regionId] = d.Region()  // 更新老 Region 缓存
+	d.ctx.storeMeta.regions[newRegion.Id] = newRegion // 添加新 Region 缓存
+
+	d.ctx.storeMeta.Unlock()
+	// 这个peer就是我们之前的封装咯
+	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+	if err != nil {
+		// 这里的错误通常是致命的，Panic 也许是更好的选择
+		log.Errorf("create new peer failed: %v", err)
+		return
+	}
+	// 路由表注册一下
+	d.ctx.router.register(newPeer)
+	// 这里是要发送一个tickerDriver的启动，启动新Region的心脏
+	_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
+	log.Infof("Split success! Old: %v, New: %v", d.Region(), newRegion)
+
+	// 通知 Scheduler 更新路由信息 (Heartbeat)
+	// 可以在这里手动触发一次 Heartbeat，或者等下一次 Tick
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		// 也要帮新 Region 报个到吗？新 Peer 启动后自己会报的
+	}
 }
