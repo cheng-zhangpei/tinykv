@@ -70,6 +70,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	kvWB := new(engine_util.WriteBatch) // 在循环外创建
 	for _, entry := range rd.CommittedEntries {
 		d.processCommittedEntry(&entry, kvWB) // 只操作内存 WB
+		if d.stopped {
+			// 既然已经 stopped (destroy) 了，说明刚才那个 entry 是自杀命令。
+			// 那么 kvWB 里的任何更新（包括 ApplyState）都不应该再写入了！
+			// 因为 Peer 已经把自己删干净了，这里再写就是“诈尸”。
+			return
+		}
 		if d.peerStorage.AppliedIndex() < entry.Index {
 			// 更新内存里的 AppliedIndex
 			d.peerStorage.SetAppliedIndex(entry.Index)
@@ -144,11 +150,29 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		}
 		return errEpochNotMatching
 	}
+	for _, r := range req.Requests {
+		var key []byte
+		switch r.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key = r.Get.Key
+		case raft_cmdpb.CmdType_Put:
+			key = r.Put.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = r.Delete.Key
+		}
+		if len(key) > 0 {
+			err := util.CheckKeyInRegion(key, d.Region())
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return err
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	// 1. 预检查 (Leader? Term? StoreID?)
+
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
@@ -979,8 +1003,13 @@ func (d *peerMsgHandler) onRegionSplit(split *raft_cmdpb.SplitRequest, kvWB *eng
 	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
 	// 4、更新路由表
 	d.ctx.storeMeta.Lock()
+	// 需要将在B树索引里面的内容给删了，否则B树的构建可能会出问题
+	d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: d.Region()})
+
 	d.ctx.storeMeta.regions[d.regionId] = d.Region()  // 更新老 Region 缓存
 	d.ctx.storeMeta.regions[newRegion.Id] = newRegion // 添加新 Region 缓存
+	// 将更新之后的指针位置region重新插入B树索引表中
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: d.Region()})
 
 	d.ctx.storeMeta.Unlock()
 	// 这个peer就是我们之前的封装咯

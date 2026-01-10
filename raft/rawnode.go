@@ -137,6 +137,7 @@ func (rn *RawNode) ApplyConfChange(cc pb.ConfChange) *pb.ConfState {
 	default:
 		panic("unexpected conf type")
 	}
+	rn.Raft.PendingConfIndex = 0
 	return &pb.ConfState{Nodes: nodes(rn.Raft)}
 }
 

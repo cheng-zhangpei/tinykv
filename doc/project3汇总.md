@@ -48,9 +48,71 @@ Leader Transfer其实基本都是raft部分的状态变化，我们在proposeRaf
 
 ## LabB 
 
-分片的触发逻辑：在TinyKV中，tickDriver所触发的时钟发送给peer_msg_handler的时候会由时钟触发两个函数：一个函数是往d.onSplitRegionCheckTick(),这个函数是检查是否达到分裂的阈值的，如果需要分裂就发送一个请求给regionCheckWorker,让worker用迭代器扫描一遍startKey到endKey之间的key，如果超过阈值的话，就去这个阈值处作为SplitKey返回给Leader，这个时候返回的handMsg的msgType是MsgTypeSplitRegion，这里将数据丢给onPrepareSplitRegion这个函数，这个函数发向PD的，大概的意思是要PD为这个分裂的新的节点生成一下编号包括store的编号和peer的编号。原来达到阈值的region就保持不变就好了。返回的时候将相关的信息比如NewRgionId之类的填写到信息里面去。 
+分片的触发逻辑：在TinyKV中，tickDriver所触发的时钟发送给peer_msg_handler的时候会由时钟触发两个函数：一个函数是往d.onSplitRegionCheckTick(),这个函数是检查是否达到分裂的阈值的，如果 需要分裂就发送一个请求给regionCheckWorker,让worker用迭代器扫描一遍startKey到endKey之间的key，如果超过阈值的话，就去这个阈值处作为SplitKey返回给Leader，这个时候返回的handMsg的msgType是MsgTypeSplitRegion，这里将数据丢给onPrepareSplitRegion这个函数，这个函数发向PD的，大概的意思是要PD为这个分裂的新的节点生成一下编号包括store的编号和peer的编号。原来达到阈值的region就保持不变就好了。返回的时候将相关的信息比如NewRgionId之类的填写到信息里面去。 
 
 拿到这个信息之后就开始下放这个resp，也就是去做propose-> raft -> ready -> handleReadyStatus -> procressiCommittedEntries -> proposeAdminRequest，从这个函数开始开始真正的分裂集群。
 
+-----------
 
+>ok, 稍微停一下，这里复盘一下这些持久化的元数据
+>
+>**RaftDB (`raftWB`)**：
+>
+>1. **RaftLog** (Key: `z{regionId}_{index}`): 日志条目。这是共识的基础。
+>2. **RaftLocalState** (Key: `r{regionId}s`): 包含 `HardState` (Term, Vote, Commit) + `LastIndex`。这是 Raft 重启后能“接上断点”的关键。
+>
+>**KvDB**
+>
+>1. **用户数据** (Key: `z{key}`): 也就是 Client `Put` 进来的数据。
+>2. **RegionLocalState** (Key: `r{regionId}l`): 包含了 `Region` 的完整定义（StartKey, EndKey, Epoch, Peers）。
+>
+>上面这两个db（本质是一个db但是不同的wb）都是存在一个Store物理机器上的。调度器是有自己独立的存储单元比如etcd的。调度器会存j几个东西：
+>
+>	1. 所有store的状态与路由
+>	1. 所有peer的状态与路由
+>
+>**GlobalContext** 是由所有的peer共享的上下文，Peer是可以修改这个context
+>
+>	1. 所有region的map
+>	1. 所有region的key范围（这里是用一个B树来维护的）
+
+我在做Region分裂的时候产生了一个疑问，我们新region在分裂的时候都是位于同一个的Store中的，新的region不应该触发调度吗？案例来说在创建之处为啥不将新的peer放到其他Node中？
+
+答案：因为 Split 的本质是 **“逻辑切分”**，而不是 **“数据搬运”**。region的数据是位于同一个store上的，所以两个region数据在一开始是相邻的。如果要同步将数据迁移的话，会占用大量网络IO。
+
+------------
+
+## 3A与3B过程中遇到的corner case
+
+#### Leader Transfer：The Missing TimeoutNow
+
+- 现象：Leader 收到 Transfer 请求，发现与follower的日志没有对齐，发了 Append 给 Follower 追数据，然后就没有然后了。Transfer 超时。
+
+- **原因**：handleTransferLeader` 只执行一次。如果 Follower 当时没追平，Leader 发了 Append 就结束了。当 Follower 追平并回复 `AppendResponse` 时，Leader 忘了检查“是不是正在 Transfer”，没发 `TimeoutNow
+
+#### ConfChange ：The Unapplied Pending
+
+- **现象**：`reject conf change because pending > applied`。
+- **原因**：Leader 提议了 ConfChange，但 Apply 线程卡住或挂了，导致 `PendingConfIndex` 无法清零。后续请求一直被拒。
+- **解法**：确保 `ApplyConfChange`（清零 Pending）和 `destroyPeer`（自杀）的执行顺序正确。**更重要的是，要在 Propose 阶段就拦截掉非法的并发 ConfChange。** 
+
+​	
+
+#### B-Tree 的索引损坏
+
+- **现象**：`GetCF` 能读到数据，但 `Iterator.Seek` 读不到。
+- **原因**：BadgerDB 底层对 `Default` CF 里的 Key 自动加了 `default_` 前缀。`GetCF` 会自动处理，但 `NewIterator` 是 Raw 的，需要手动加前缀才能 Seek 到正确位置。
+- **解法**：在 `Entries` 方法里手动拼接 `seekKey = "default_" + startKey`。
+
+#### “诈尸” (The Zombie Peer)
+
+- **现象**：Peer 自杀后，重启时又复活了，而且状态错乱 (`LastIndex < AppliedIndex`)。
+- **原因**：`destroyPeer` 删除了 `ApplyState`，但 `HandleRaftReady` 循环还在继续，后面的逻辑又把 `ApplyState` 写回去了。
+- **解法**：在 `HandleRaftReady` 循环里，每次 Apply 后检查 `d.stopped`。如果已死，立即 `return`，切断后续写入。
+
+####  持久化顺序 (Crash Consistency
+
+- **现象**：重启后 Panic `Unavailable`（Log 空洞）。
+- **原因**：先写了 RaftDB (LastIndex 更新)，后写 KvDB (Snapshot/TruncatedIndex 更新)。中间断电，导致 LastIndex 很大，但 Log 其实被截断了。
+- **解法**：**先 KV 后 Raft**。宁可丢数据（Log 没写进），不可存脏指针（Log 没写进但 Index 变了）。
 

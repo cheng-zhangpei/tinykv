@@ -341,9 +341,9 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// if m.Term > r.Term no matter which state, the node should become the follower
-	if m.MsgType == pb.MessageType_MsgTimeoutNow {
-		log.Infof("%d received timeout now from %d", r.id, m.From) // 看看收没收到
-	}
+	//if m.MsgType == pb.MessageType_MsgTimeoutNow {
+	//	log.Infof("%d received timeout now from %d", r.id, m.From) // 看看收没收到
+	//}
 	if m.Term > r.Term {
 		r.leadTransferee = None // 如果正在 Transfer，Term 变了就终止
 		r.Term = m.Term
@@ -381,6 +381,7 @@ func (r *Raft) removeNode(id uint64) {
 		return
 	}
 	delete(r.Prs, id)
+	delete(r.votes, id)
 	// 重新计算 Commit: 因为删除节点所以会导致原来committed仲裁结果不一样，所以这里需要重新计算一次
 	if r.State == StateLeader {
 		r.maybeCommit()
@@ -637,6 +638,7 @@ func (r *Raft) handleAppendLogEntryResponse(m pb.Message) {
 		r.Prs[m.From].Next = m.Index + 1
 		if r.maybeCommit() {
 			r.bcastAppend()
+			//log.Infof("Leader %d commit advanced to %d", r.id, r.RaftLog.committed)
 		}
 	}
 	//log.Infof("(handleEntriesResponse)Prs[transferee].Match=%d  r.RaftLog.LastIndex()= %d", r.Prs[m.From].Match, r.RaftLog.LastIndex()) // 看看发没发
