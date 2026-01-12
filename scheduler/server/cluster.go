@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"path"
 	"sync"
 	"time"
@@ -278,8 +279,42 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
-
+	// Scheduler updates local information; and Schedule function for the balance-region scheduler,
+	// in which the Scheduler scans stores and determines whether there is an imbalance and which
+	// region it should move.
+	// 1. 检查epoch、confVer等等参数的匹配，防止旧心跳或者是分区而导致的有问题的心跳
+	localRegion := c.core.GetRegion(region.GetID()) // 拿到集群信息
+	if localRegion != nil {
+		// 这里两个字段都比较了，confVer和epoch
+		if util.IsEpochStale(region.GetRegionEpoch(), localRegion.GetRegionEpoch()) {
+			return errors.Errorf("region is stale: region %v, local %v", region, localRegion)
+		}
+	} else {
+		// 心跳发来的region并不在调度器的元数据中
+		// 检查发的region的范围是否与现在调度器的记录有重叠，如果有重叠，那么可能说明现在调度器中的数据有分区
+		overlappedRegions := c.core.ScanRange(region.GetStartKey(), region.GetEndKey(), 0)
+		// 扫描这些有重叠的region，如果心跳的数据更旧，那说明这个心跳是stale的
+		for _, overlappedRegion := range overlappedRegions {
+			if util.IsEpochStale(region.GetRegionEpoch(), overlappedRegion.GetRegionEpoch()) {
+				return errors.Errorf("region overlap with stale epoch:"+
+					" region %v, overlap %v", region, overlappedRegion)
+			}
+		}
+	}
+	// 2. 检查有没有必要更新元数据
+	if localRegion != nil {
+		// 所有的参数都没有变化
+		if region.GetRegionEpoch().GetVersion() == localRegion.GetRegionEpoch().GetVersion() &&
+			region.GetRegionEpoch().GetConfVer() == localRegion.GetRegionEpoch().GetConfVer() &&
+			region.GetLeader().GetId() == localRegion.GetLeader().GetId() &&
+			len(region.GetPendingPeers()) == 0 && len(localRegion.GetPendingPeers()) == 0 &&
+			region.GetApproximateSize() == localRegion.GetApproximateSize() {
+			return nil // Skip update
+		}
+	}
+	// 3. 执行更新操作
+	c.core.PutRegion(region)
+	// 更新 StoreStatus？
 	return nil
 }
 

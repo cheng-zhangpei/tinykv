@@ -116,3 +116,125 @@ Leader Transfer其实基本都是raft部分的状态变化，我们在proposeRaf
 - **原因**：先写了 RaftDB (LastIndex 更新)，后写 KvDB (Snapshot/TruncatedIndex 更新)。中间断电，导致 LastIndex 很大，但 Log 其实被截断了。
 - **解法**：**先 KV 后 Raft**。宁可丢数据（Log 没写进），不可存脏指针（Log 没写进但 Index 变了）。
 
+-----
+
+## 3C
+
+先重点说说整个调度器的工作原理，如果只是学一下心跳怎么写其实蛮没意思的
+
+```
++---------------------------------------------------------+
+|                    RaftCluster (大脑)                   |
+| ------------------------------------------------------- |
+|  [ BasicCluster (Core) ]                                |
+|    - Stores: map[uint64]*StoreInfo  (机器状态)          |
+|    - Regions: B-Tree / Map          (数据分布地图)      |
+| ------------------------------------------------------- |
+|  [ Coordinator (协调员) ]                               |
+|    - Schedulers: [BalanceRegion, BalanceLeader, ...]    |
+|    - Operators: map[uint64]*Operator (正在执行的搬迁)   |
++---------------------------------------------------------+
+```
+
+其实总体就两部分：
+
+1） 机器视角：Store状态、Region视角（数据分布情况）
+
+2）不同类型的调度算法 + 一个执行操作的序列
+
+---
+
+
+
+scheduler/server/schedulers/balance_region.go 里，你会实现一个 BalanceRegionScheduler。它的核心方法是 Schedule(cluster *core.RaftCluster)。Schedule()这个方法是整个调度器的核心，每隔一段时间就会重新被唤醒进行一次check和调度。下面重点说一个负载均衡的调度算法，其实思维蛮简单的，就是怎么从头写才是最难的。
+
+#### 步骤一：选出“被调度者” (Select Source Store)
+
+我们要从哪里搬走 Region？当然是**最满**或者是**最忙**的 Store。
+
+- **指标**：在 TinyKV 里，我们主要看 `RegionSize` (磁盘占用)。
+- **筛选**：遍历所有 Store，过滤掉 down 的、busy 的。
+- **打分**：按照 `RegionSize` 降序排列。
+- **选中**：选出 Size 最大的那个 Store 作为 `Source Store`。
+
+#### 步骤二：选出“幸运儿” (Select Target Store)
+
+我们要把 Region 搬到哪里去？当然是**最空**的 Store。
+
+- **筛选**：遍历所有 Store，过滤掉 Source Store。
+- **打分**：按照 `RegionSize` 升序排列。
+- **选中**：选出 Size 最小的那个 Store 作为 `Target Store`
+
+#### 步骤三：选出“搬运对象” (Select Region)
+
+在 `Source Store` 上有成千上万个 Region，搬哪个？
+
+- 策略（其实这也是写死的调度策略，理解起来都不难但是为啥要这样设计呢）：
+  - **Pending Peer 优先**：如果有 Peer 正处于 Pending (还没建好)，赶紧搬走修好它？不，通常 BalanceRegion 不管这个。
+  - **Follower 优先**：搬运 Leader 代价大（要切主），搬运 Follower 代价小。
+  - **随机/顺序**：在 TinyKV 里，通常是随机选一个，或者选一个 Size 最大的。
+  - **关键约束**：**不能搬到“已经有副本”的 Store 上！** (一个 Region 在同一个 Store 上只能有一个副本)。
+
+#### 步骤四：决策评估 (The Final Check)
+
+这一步是防抖动的关键。
+
+- `SourceSize` = 1000MB
+- `TargetSize` = 990MB
+- `RegionSize` = 20MB
+
+如果搬过去了：
+
+- Source = 980MB
+- Target = 1010MB
+- **结果**：不平衡反转了！而且搬运有网络开销。
+- **规则**：只有当 `Source - Target > 2 * RegionSize` (或者某个阈值) 时，才值得搬运。说白了就是两者相差不大的时候才值得搬运迁移数据。
+
+
+
+#### 步骤五：生成 Operator
+
+如果通过了评估，就生成一个 `MovePeerOperator`。
+包含：
+
+1. `AddPeer(Target)`
+2. `RemovePeer(Source)`
+
+---------------
+
+下面来正式开始3C的全过程：
+
+#### 调度器心跳处理
+
+心跳处理中有很多对消息判断的细节：
+
+1、利用epoch和confVer判断消息的时效性来保障幂等性和线性一致
+
+2、本地有或者没有这个region其实是两种情况
+
+​	如果本地有这个region，我们要把传入的这个region的startKey和endKey去整个region的视角去找是否有重叠的部分，如果有重叠的region而且，这个重叠的region还更加新，说明发来的region是一个stale的。我们还要检查是否各个字段的值有变化，只有变化了才需要更新，因为心跳过程可能收到的更多的还是无变化的报告心跳。
+
+​	如果本地没有就直接放到region的索引里面就好了。
+
+#### 实现region间平衡的调度算法
+
+​	对于调度，本质还是选择下面三个元素：1、源Store的选择   2、Store上的Regoin选择     3、目标Store的选择
+
+​	整个调度写成一个嵌套循环：遍历整个按照Size排序的算法：从最大的Store作为源store开始，在这个Store上找合适的region，这个region怎么找？我们按照**Pending -> Follower -> Leader** 这个顺序来选 Region 搬迁，这个逻辑链路的本质是一种损耗最小化。
+
+Pending本身说明replica还没有在Store上创建，所以这个时候将其迁移是损耗最小的，Follower作为replica还有其他leader节点在正常运行，所以集群运行还是没问题的，只是一个replica暂时断联。最后迁移leader会导致整个集群进入一段暂时的写真空期，要集群重新选举leader才会使得整个集群再次可用。往往走到第三条损耗就已经非常大了。
+
+​	找到peer之后，再往后去寻找target，这个时候需要从后往前找，找容量大的Store进行迁移，这里我们需要衡量一下source和target之间的容量差距，如果差距过小就会导致抖动。
+
+​	如果都不满足就从新找一个Store这样循环。这三者找到之后我们需要更具这三者之间的关系生成一个Operator，这个Operator做具体的迁移的工作比如AddNode、RemoveNode这样的operator
+
+
+
+
+
+----
+
+## 对于调度器深度的理解
+
+todo：我后面有空学学这个调度器是怎么写的，之前看得更多的还是别人调度器的设计，还没有自己试着写一个调度器.....
+
