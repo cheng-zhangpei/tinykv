@@ -1682,6 +1682,11 @@ type KeyError struct {
 	XXX_sizecache        int32          `json:"-"`
 }
 
+func (m *KeyError) Error() string {
+	//TODO implement me
+	panic("implement me")
+}
+
 func (m *KeyError) Reset()         { *m = KeyError{} }
 func (m *KeyError) String() string { return proto.CompactTextString(m) }
 func (*KeyError) ProtoMessage()    {}

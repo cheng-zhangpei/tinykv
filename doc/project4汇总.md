@@ -34,8 +34,6 @@ TinyKV 有一个 **`Latches`** 结构（在 `kv/transaction/latches/latches.go`�
 
 对于一个key的事务操作：先去Write CF中看看在这个key的StartTs后面有没有提交记录，如果有就冲突。看完再去Lock CF看看有没有人正在更新事务，如果有，冲突。最后才是去Default中去修改数据并且更新Lock CF将锁占有。
 
-
-
 #### 跨集群事务
 
 - 传统2PC事务
@@ -115,6 +113,8 @@ Latches的本质是一个 **分段锁 (Sharded Lock)** 或者 **基于 Hash 的�
 
 后面稍微说一下两个函数一个是KVPreWrite()和KVCommit()函数。
 
+-----
+
 
 
 
@@ -144,6 +144,10 @@ Secondary Key 的命运完全绑定在 Primary Key 上。Secondary Lock 里存�
 它不需要所有节点之间互相通信。它只需要任意节点都能访问到 Primary Key 所在的那一个节点。
 
 Percolator 把所有跨集群的key的协调全部交给了Client来做....其实逻辑真的不会非常难的感觉。
+
+----
+
+下面梳理一下4C写的函数的细节
 
 
 
