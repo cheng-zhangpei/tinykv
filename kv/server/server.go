@@ -3,13 +3,12 @@ package server
 import (
 	"context"
 	"errors"
-	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
-	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
-
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
+	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	coppb "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
@@ -67,11 +66,9 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 	if err != nil {
 		return nil, err
 	}
-	// 有锁就丢给客户端让客户端重新发
-	if lock != nil {
-		resp.Error = &kvrpcpb.KeyError{
-			Locked: lock.Info(req.Key),
-		}
+	// 有锁就丢给客户端让客户端重新发,记住，锁也是有版本的。
+	if lock != nil && lock.Ts <= req.Version {
+		resp.Error = &kvrpcpb.KeyError{Locked: lock.Info(req.Key)}
 		return resp, nil
 	}
 
@@ -90,7 +87,9 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 // KvPrewrite 将req的操作放到暂存区，放入之前需要先加锁，等commit之后才将
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	resp := &kvrpcpb.PrewriteResponse{}
-
+	if len(req.Mutations) == 0 {
+		return &kvrpcpb.PrewriteResponse{}, nil
+	}
 	// 1. 获取所有 Key 并加锁 (Latches)
 	// 防止并发请求同时修改内存中的状态导致竞态
 	var keys [][]byte
@@ -150,6 +149,8 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 			Ttl:     req.LockTtl,
 			Kind:    mvcc.WriteKindFromProto(m.Op),
 		}
+		//log.Infof("prewrite lock Kind: %v", lock.Kind)
+
 		txn.PutLock(key, lock)
 		//
 		if m.Op == kvrpcpb.Op_Put {
@@ -157,6 +158,9 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		} else if m.Op == kvrpcpb.Op_Del {
 			txn.DeleteValue(m.Key)
 		}
+	}
+	if len(txn.Writes()) == 0 {
+		return resp, nil
 	}
 	// 这里需要注意一个点，就是我们TinyKV的暂存区是在磁盘中的，所以要有一个写操作
 	err = server.storage.Write(req.Context, txn.Writes())
@@ -169,7 +173,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		return nil, err
 	}
 
-	return nil, nil
+	return resp, nil
 }
 
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
@@ -201,20 +205,21 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 			// 看看这个write的类型
 			if write != nil {
 				// 如果不是rollBack就说明成功了
-				if write.Kind != mvcc.WriteKindRollback {
-					continue
+				if write.Kind == mvcc.WriteKindRollback {
+					resp.Error = &kvrpcpb.KeyError{Retryable: "write conflict: rollback"}
+					return resp, nil
 				}
-				// 如果是 Rollback，说明被回滚了，那是真失败了
-				resp.Error = &kvrpcpb.KeyError{Retryable: "write conflict: rollback"}
-				return resp, nil
+				// 否则说明是 Put/Delete，那是重复提交，幂等成功
+				continue
 			}
+			resp.Error = &kvrpcpb.KeyError{Retryable: "write conflict: rollback"}
+			return resp, nil
 		}
 		// 不是我的锁
 		if lock.Ts != req.StartVersion {
 			resp.Error = &kvrpcpb.KeyError{Retryable: "lock startTs mismatch"}
 			return resp, nil
 		}
-		// 生成commit并写入
 		txn.PutWrite(key, req.CommitVersion, &mvcc.Write{
 			StartTS: req.StartVersion,
 			Kind:    lock.Kind,
@@ -241,6 +246,7 @@ KvScan
 它必须处理锁（遇到锁要报错）。
 */
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
+
 	resp := &kvrpcpb.ScanResponse{}
 	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
@@ -252,7 +258,6 @@ func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrp
 		}
 	}
 	defer reader.Close()
-
 	txn := mvcc.NewMvccTxn(reader, req.Version)
 	scanner := mvcc.NewScanner(req.StartKey, txn)
 	defer scanner.Close()
@@ -293,74 +298,84 @@ KvCheckTxnStatus 查询：Primary Key (主键) 到底提交了没？还在运行
 */
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	resp := &kvrpcpb.CheckTxnStatusResponse{}
-	keys := make([][]byte, 0)
-	keys = append(keys, req.PrimaryKey)
-	server.Latches.AcquireLatches(keys)
-	defer server.Latches.ReleaseLatches(keys)
-	// 1、 先看看是不是已经提交了
+
+	// 1. Latches
+	server.Latches.AcquireLatches([][]byte{req.PrimaryKey})
+	defer server.Latches.ReleaseLatches([][]byte{req.PrimaryKey})
+
+	// 2. Reader & Txn
 	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return regionError(err, resp)
+	} // 封装一个 regionError 辅助函数
+	defer reader.Close()
+	txn := mvcc.NewMvccTxn(reader, req.LockTs)
+
+	// 3. Check Write CF (Commited or Rollbacked?)
+	write, commitTS, err := txn.CurrentWrite(req.PrimaryKey)
 	if err != nil {
 		return nil, err
 	}
-	txn := mvcc.NewMvccTxn(reader, req.CurrentTs)
-	write, commitTS, err := txn.CurrentWrite(req.PrimaryKey)
 	if write != nil {
-		// 事务已经提交了
+		// 已经有结果了
 		if write.Kind != mvcc.WriteKindRollback {
-			// 已经提交了！告诉 Client提交的时间戳,如果是提交那么这个字段默认为 0
 			resp.CommitVersion = commitTS
 		}
 		return resp, nil
 	}
-	// 没有提交就开始查锁
+
+	// 4. Check Lock CF
 	lock, err := txn.GetLock(req.PrimaryKey)
 	if err != nil {
 		return nil, err
 	}
-	// 是否持有锁这两种情况又分为很多不一样的类型
-	if lock != nil {
-		// 既没 Commit，也没 Lock。说明锁丢了（可能被回滚了但 Write CF 被 GC 了？或者压根没 Prewrite 成功？）
-		// 或者是 TTL 超时被别人清了？
-		// 为了安全，我们必须在这里补一个 Rollback Record！防止它以后又诈尸提交。
-		// 写入 Rollback Record
+
+	// Case A: Lock 丢失 (且没 Write 记录) -> 视为回滚
+	if lock == nil {
+		// 写入 Rollback Record 防重放
 		txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
 			StartTS: req.LockTs,
 			Kind:    mvcc.WriteKindRollback,
 		})
+		if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+			return regionError(err, resp)
+		}
 		resp.Action = kvrpcpb.Action_LockNotExistRollback
-		// 写盘 & 返回
-		err = server.storage.Write(req.Context, txn.Writes())
-		if err != nil {
-			if regionErr, ok := err.(*raft_storage.RegionError); ok {
-				resp.RegionError = regionErr.RequestErr
-				return resp, nil
-			}
-			return nil, err
-		}
-	}
-	// 锁还在就要检查TTL了
-	if mvcc.PhysicalTime(lock.Ts)+lock.Ttl <= mvcc.PhysicalTime(req.CurrentTs) {
-		txn.DeleteLock(req.PrimaryKey)
-		txn.DeleteValue(req.PrimaryKey) // 把 Prewrite 的数据也删了
-		txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
-			StartTS: req.LockTs,
-			Kind:    mvcc.WriteKindRollback,
-		})
-		resp.Action = kvrpcpb.Action_TTLExpireRollback
-		// 写盘
-		err = server.storage.Write(req.Context, txn.Writes())
-		if err != nil {
-			if regionErr, ok := err.(*raft_storage.RegionError); ok {
-				resp.RegionError = regionErr.RequestErr
-				return resp, nil
-			}
-			return nil, err
-		}
 		return resp, nil
 	}
-	// 锁还在并且还没有超时这个时候就把数据丢给client告诉他等着，这里还有事务没有搞定
+
+	// Case B: Lock 存在，检查 TTL
+	if mvcc.PhysicalTime(lock.Ts)+lock.Ttl <= mvcc.PhysicalTime(req.CurrentTs) {
+		// TTL 过期 -> 回滚
+		txn.DeleteLock(req.PrimaryKey)
+		txn.DeleteValue(req.PrimaryKey)
+		txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+			StartTS: req.LockTs,
+			Kind:    mvcc.WriteKindRollback,
+		})
+		if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+			return regionError(err, resp)
+		}
+		resp.Action = kvrpcpb.Action_TTLExpireRollback
+		return resp, nil
+	}
+
+	// Case C: Lock 存在且没过期 -> 等待
 	resp.LockTtl = lock.Ttl
 	return resp, nil
+}
+
+// 辅助函数: regionError
+func regionError(err error, resp interface{}) (*kvrpcpb.CheckTxnStatusResponse, error) {
+	// 利用反射或者类型断言把 RegionError 塞进去
+	// 这里为了简单，假设 resp 就是 CheckTxnStatusResponse
+	if r, ok := resp.(*kvrpcpb.CheckTxnStatusResponse); ok {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			r.RegionError = regionErr.RequestErr
+			return r, nil
+		}
+	}
+	return nil, err
 }
 
 /*

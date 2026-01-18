@@ -2,7 +2,9 @@ package mvcc
 
 import (
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
+	"math"
 )
 
 // Scanner is used for reading multiple sequential key/value pairs from the storage layer. It is aware of the implementation
@@ -12,14 +14,19 @@ type Scanner struct {
 	txn     *MvccTxn
 	iter    engine_util.DBIterator // 这是一个write区的迭代器
 	nextKey []byte
+
+	prefix []byte
 }
 
 // NewScanner creates a new scanner ready to read from the snapshot in txn.
 func NewScanner(startKey []byte, txn *MvccTxn) *Scanner {
+	prefix := []byte(engine_util.CfWrite + "_")
+
 	return &Scanner{
 		txn:     txn,
 		iter:    txn.Reader.IterCF(engine_util.CfWrite),
 		nextKey: startKey,
+		prefix:  prefix,
 	}
 }
 
@@ -27,57 +34,99 @@ func (scan *Scanner) Close() {
 	scan.iter.Close()
 }
 
+func NextKey(key []byte) []byte {
+	next := make([]byte, len(key)+1)
+	copy(next, key)
+	next[len(key)] = 0 // append 0
+	return next
+}
+
 // Next returns the next key/value pair from the scanner.
 // If the scanner is exhausted, then it will return `nil, nil, nil`.
 // 说白了这个函数就是返回一个事务存在于Store的所有key
 func (scan *Scanner) Next() ([]byte, []byte, error) {
-	// 这里写for循环的原因是有些write是delete类型的，我要删除这里的delete类型
+	// 每次调用都重新 Seek 到 nextKey，防止之前的迭代器状态干扰
+	seekKey := EncodeKey(scan.nextKey, math.MaxUint64)
+	scan.iter.Seek(seekKey)
+
 	for {
-		// Write中有记录,这个seek是往前找，小于StartTs的最新的commit日志哦
-		scan.iter.Seek(EncodeKey(scan.nextKey, scan.txn.StartTS))
 		if !scan.iter.Valid() {
 			return nil, nil, nil
 		}
+
 		item := scan.iter.Item()
 		key := item.KeyCopy(nil)
 		userKey := DecodeUserKey(key)
-		nextUserKey := append([]byte{}, userKey...) // 拷贝一份
-		nextUserKey = append(nextUserKey, 0)        // 加一个 0 字节
-		// 更新 Scanner 的状态，下次 Seek 用这个，这里是跳过了所有userKey的不同版本，在Store中，一个key的相同版本是并列放在一起的
-		// 这个并列估计是底层LSM树的索引的特性
-		scan.nextKey = nextUserKey
 
-		// 用userKey去拿锁
-		lock, err := scan.txn.GetLock(userKey)
-		if err != nil {
-			return nil, nil, err
+		// 记录当前正在处理的 UserKey
+		currentUserKey := userKey
+
+		// 检查 CommitTS
+		commitTS := DecodeTimestamp(key)
+		if commitTS > scan.txn.StartTS {
+			// 版本太新，不可见。
+			// 我们需要找当前 UserKey 的旧版本，所以只做 Next
+			scan.iter.Next()
+			continue
 		}
-		if lock != nil && lock.Ts <= scan.txn.StartTS {
-			// 说明这个事务已经commit，但是还没有释放锁或者还有其他的事务在修改
-			return nil, nil, &kvrpcpb.KeyError{Locked: lock.Info(userKey)}
-		}
-		// 没有锁
+
+		// 找到了 <= StartTS 的版本！
+		// 无论它是 Put 还是 Delete，这个 UserKey 的处理到此为止。
+		// 准备好下一次调用的起点：跳过当前 UserKey
+		scan.nextKey = NextKey(currentUserKey)
+
+		// 解析 Write Record
 		val, err := item.Value()
 		if err != nil {
 			return nil, nil, err
 		}
-		// 将Write区中的数据解析一下
 		write, err := ParseWrite(val)
-
 		if err != nil {
 			return nil, nil, err
 		}
+
+		// 如果是 Delete 或 Rollback
 		if write.Kind != WriteKindPut {
+			// 这个 Key 对用户不可见。
+			// 我们必须跳过这个 UserKey 的所有剩余旧版本，直接去找下一个 UserKey。
+			// 使用 nextKey 重新 Seek
+			seekKey = EncodeKey(scan.nextKey, math.MaxUint64)
+			scan.iter.Seek(seekKey)
 			continue
 		}
-		// 这里说明这个数据是这个事务存在于这个数据库的数据了
 
-		value, err := scan.txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(userKey, write.StartTS))
+		// 如果是 Put
+		// 1. 检查 Lock (必须检查，否则无法实现 SI)
+		lock, err := scan.txn.GetLock(currentUserKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		if lock != nil && lock.Ts <= scan.txn.StartTS {
+			return nil, nil, &kvrpcpb.KeyError{Locked: lock.Info(currentUserKey)}
+		}
+
+		// 2. 获取 Value
+		value, err := scan.txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(currentUserKey, write.StartTS))
 		if err != nil {
 			return nil, nil, err
 		}
 
-		return userKey, value, nil
+		return currentUserKey, value, nil
 	}
+}
+func (scan *Scanner) DebugDump() {
+	iter := scan.txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
 
+	// 用空 Key 来 Seek 到最前面
+	for iter.Seek([]byte{}); iter.Valid(); iter.Next() {
+		item := iter.Item()
+		userKey := DecodeUserKey(item.Key())
+		ts := DecodeTimestamp(item.Key()) // 注意函数名大小写
+		val, _ := item.Value()
+		write, _ := ParseWrite(val)
+
+		log.Infof("DUMP: UserKey=%v, CommitTS=%d, Kind=%v, StartTS=%d",
+			userKey, ts, write.Kind, write.StartTS)
+	}
 }

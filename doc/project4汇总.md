@@ -147,7 +147,155 @@ Percolator 把所有跨集群的key的协调全部交给了Client来做....其�
 
 ----
 
-下面梳理一下4C写的函数的细节
+下面梳理一下4C写的函数的细节,
+
+```go
+func (server *Server) KvScan
+func (server *Server) KvCheckTxnStatus
+func (server *Server) KvBatchRollback
+func (server *Server) KvResolveLock
+```
+
+- KvScan
+
+这个函数的作用是扫描一个事务中有的key。
+
+这个函数的关键就是Scanner的实现，这个实现还是蛮难的，对于一个Store来说，存储的key的不同版本是并列排在一起的，所以在扫描的过程中不能完全顺下来扫，需要跳过旧版本的数据，而且我们也不能返回是delete的数据，因为已经删了不存于事务中。
+
+1、如何跳过旧版本的数据，我们在Key的末尾的加一个0，表示最大的版本字节（这是由数据在数据库中的排列特性决定的，因为后面是时间戳，所以加一个0可以保证跳过所有的时间戳）
+
+2、我们需要从拿到的write中去将delete类型的数据给跳过。然后就是按照limit拿数据
+
+- KvCheckTxnStatus
+
+​		这个函数的作用是检查主键状态的，在别的事务访问一个Key的时候发现有锁，这个时候就需要去调用这个函数来检查主键的情况从而决定现在要干些啥东西
+
+​		现在我是主键所在的Store，我调了KvCheckTxnStatus，首先我要去查write区看看有没有提交，如果提交了，并且不是RollBack，就返回就好了
+
+​		如果有锁而且没提交，我们要检查是否达到了TTL，如果达到了我们要手动回滚这个事务（范围error给client），如果没有达到的话就把TTL返回给Client就好了
+
+​                                                                                                                                                                                                                                             
+
+- KvBatchRollback
+
+KvBatchRollback这个函数是client发现主键挂了，现在要把这个事务所有其他的key全部都清除的时候，需要清除key的store调用的函数。
+
+如果有锁，先判断是不是需要删除的位置的锁，如果是，就把这把锁删掉，并且附带一个rollback事务就好了。最后把这个事务持久化就好了。
+
+- KvResolveLock
+
+​	这个函数的使用场景是在一个事务查询key的过程中发现，这个key是从键而且有锁，这个时候如何处理这个key就完全取决于主键的状态，如果主键已经提交并且不是回滚的类型，这个时候就commit这个事务在当前store的key就好了，如果已经持有锁但是过期，或者是主键rollback这个时候就回滚。
 
 
+
+-----
+
+事务流程：
+
+### 案例 1：Client 在 Prewrite 阶段挂了 (主动/被动回滚)
+
+**场景：**
+Client 想要修改 A (Primary) 和 B (Secondary)。
+
+1. **Prewrite(A)**: 成功。A 上有了锁 (StartTS=100)。
+2. **Prewrite(B)**: **失败**（比如网络断了，或者 Client 崩溃了）。
+3. **结果**：A 被锁住了，B 没锁（或者也没写进去）。整个事务处于“半死不活”状态。
+
+**Txn C (StartTS=120) 进场：**
+Txn C 想读 Key A。
+
+1. **读 A**: 发现 A 有锁 (StartTS=100, Primary=A)。
+2. **Check**: Txn C 向 Store 1 发送 `KvCheckTxnStatus(Primary=A, StartTS=100)`。
+3. Store 1 检查：
+   - Lock(A) 还在。
+   - Write CF 没有提交记录。
+   - 检查 TTL：
+     - **如果没过期**：Store 1 告诉 Txn C：“它还没死透，你再等等”。Txn C 只能 Backoff 重试。
+     - 如果过期了：Store 1 判定 Txn A 死亡。
+       - **Action**: 删除 Lock(A)，写入 `Write(A, StartTS=100, Kind=Rollback)`。
+       - **返回**: `Action_TTLExpireRollback`。
+4. Txn C Resolve:
+   - 既然 A 滚了，那 B 也得滚（如果 B 有锁的话）。
+   - Txn C 向 Store 2 发送 `KvResolveLock(StartTS=100, CommitTS=0)`。
+   - Store 2 扫描 Lock CF，如果发现有属于 Txn A 的锁（如果有的话），全部删掉并写 Rollback。
+
+**结局**：Txn A 彻底消失，就像没发生过一样。Txn C 可以继续读写 A 了。
+
+------
+
+### 案例 2：Client 在 Commit 阶段挂了 (Primary 未提交)
+
+这是最惊险的时刻。
+
+**场景：**
+Client 成功 Prewrite 了 A 和 B。
+Client 准备 Commit。
+
+1. **Client 发送 Commit(A)**：**网络超时/丢包**，请求没到 Store 1，或者到了但没处理完 Client 就挂了。
+2. 结果：
+   - A: 锁还在 (未提交)。
+   - B: 锁还在 (未提交)。
+
+**Txn C 进场：**
+Txn C 想读 Key B。
+
+1. **读 B**: 发现锁 (Primary=A)。
+2. **Check**: 查 A 的状态 (`KvCheckTxnStatus`)。
+3. Store 1 检查：
+   - Lock(A) 还在。
+   - Write CF 无提交记录。
+   - **判定**：只要 Primary 没提交，整个事务就是没提交。
+   - **处理**：如果 TTL 过期，执行 Rollback (同案例 1)。
+
+**结局**：因为 Primary 没成，所以大家都得死。Txn A 全员回滚。
+
+------
+
+### 案例 3：Client 在 Commit 阶段挂了 (Primary 已提交) —— **反转！**
+
+这是 Percolator 最精髓的地方。
+
+**场景：**
+Client 成功 Prewrite 了 A 和 B。
+
+1. Client 发送 Commit(A)：成功！
+   - Store 1: A 的锁删了，Write CF 里有了 `Commit(A, CommitTS=110)`。
+2. **Client 准备 Commit(B)**：**挂了！**
+3. 结果：
+   - A: 已提交。
+   - B: 锁还在 (Primary=A)。
+
+**Txn C 进场：**
+Txn C 想读 Key B。
+
+1. **读 B**: 发现锁 (Primary=A)。
+2. **Check**: 查 A 的状态 (`KvCheckTxnStatus`)。
+3. Store 1 检查：
+   - Lock(A) 没了（因为提交时删了）。
+   - 查 Write CF：**找到了！** `Commit(A, TS=110)`。
+   - **返回**: `CommitVersion = 110`。
+4. Txn C Resolve:
+   - Txn C 恍然大悟：“原来大哥 A 已经成了！那小弟 B 也得成！”
+   - Txn C 向 Store 2 发送 `KvResolveLock(StartTS=100, CommitTS=110)`。
+5. Store 2 执行：
+   - 找到 B 的锁。
+   - **执行 Commit(B)**。
+
+**结局**：虽然 Client 挂了，但因为 Primary 已经成了，后续来的 Txn C **帮忙** 把剩下的 B 也提交了。Txn A 最终是 **成功** 的。
+
+ 总结 "Primary 决定论"
+
+| Primary Key 状态         | Secondary Key 状态 | 最终结果          | 谁来执行                      |
+| :----------------------- | :----------------- | :---------------- | :---------------------------- |
+| **Lock 还在 (TTL 内)**   | Lock 还在          | **等待**          | 无 (Client 稍后重试)          |
+| **Lock 还在 (TTL 过期)** | Lock 还在          | **全员 Rollback** | 别的事务 (CheckTxnStatus)     |
+| **已 Commit**            | Lock 还在          | **全员 Commit**   | 别的事务 (ResolveLock)        |
+| **已 Rollback**          | Lock 还在          | **全员 Rollback** | 别的事务 (ResolveLock)        |
+| **啥都没查到**           | Lock 还在          | **全员 Rollback** | 别的事务 (认为 Prewrite 失败) |
+
+----
+
+## 在测试中遇到的问题
+
+1、我们在获取锁的时候，要注意一个问题，在MVCC的场景下，锁也是有版本的，所以在获取锁的时候一定要记得去比较锁版本
 

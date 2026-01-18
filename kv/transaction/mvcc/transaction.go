@@ -167,7 +167,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 		}
 		if write.StartTS == txn.StartTS {
 			// 解析出 CommitTS (Key 的后半部分)
-			commitTS := decodeTimestamp(item.Key())
+			commitTS := DecodeTimestamp(item.Key())
 
 			return write, commitTS, nil
 		}
@@ -179,6 +179,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 // write's commit timestamp, or an error.
 func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
 	iter.Seek(EncodeKey(key, math.MaxUint64))
 	if !iter.Valid() {
 		return nil, 0, nil
@@ -193,7 +194,7 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 		return nil, 0, err
 	}
 	write, err := ParseWrite(value)
-	commitTS := decodeTimestamp(item.Key())
+	commitTS := DecodeTimestamp(item.Key())
 	return write, commitTS, nil
 }
 
@@ -216,8 +217,8 @@ func DecodeUserKey(key []byte) []byte {
 	return userKey
 }
 
-// decodeTimestamp takes a key + timestamp and returns the timestamp part.
-func decodeTimestamp(key []byte) uint64 {
+// DecodeTimestamp takes a key + timestamp and returns the timestamp part.
+func DecodeTimestamp(key []byte) uint64 {
 	left, _, err := codec.DecodeBytes(key)
 	if err != nil {
 		panic(err)
