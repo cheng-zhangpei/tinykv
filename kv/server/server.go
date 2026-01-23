@@ -169,7 +169,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		if regionErr, ok := err.(*raft_storage.RegionError); ok {
 			resp.RegionError = regionErr.RequestErr
 			return resp, nil
-		}
+		} //client所负责的跨集群的通讯只有一个，secondary发现了现在这个store中有锁，去查询主键状态（包括寻找主键），
 		return nil, err
 	}
 
