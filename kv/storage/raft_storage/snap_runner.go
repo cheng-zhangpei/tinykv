@@ -176,7 +176,7 @@ func (r *snapRunner) recvSnap(stream tinykvpb.TinyKv_SnapshotServer) (*raft_serv
 	if err != nil {
 		return nil, err
 	}
-
+	log.Debug("====snapshot TRACE3====received snapshot.")
 	stream.SendAndClose(&raft_serverpb.Done{})
 	return head.GetMessage(), nil
 }

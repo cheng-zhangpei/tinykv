@@ -114,7 +114,7 @@ func (snapCtx *snapContext) applySnap(regionId uint64, startKey, endKey []byte, 
 		return err
 	}
 
-	log.Infof("applying new data. [regionId: %d, timeTakes: %v]", regionId, time.Now().Sub(t))
+	log.Infof("====snapshot TRACE4==== applying new snapshot. [regionId: %d, timeTakes: %v]", regionId, time.Now().Sub(t))
 	return nil
 }
 
@@ -141,18 +141,25 @@ func (snapCtx *snapContext) cleanUpRange(regionId uint64, startKey, endKey []byt
 
 func getAppliedIdxTermForSnapshot(raft *badger.DB, kv *badger.Txn, regionId uint64) (uint64, uint64, error) {
 	applyState := new(rspb.RaftApplyState)
+	log.Infof("Snapshot: Reading from RaftDB Ptr: %p, RegionID: %d", raft, regionId)
+
 	err := engine_util.GetMetaFromTxn(kv, meta.ApplyStateKey(regionId), applyState)
 	if err != nil {
+		log.Errorf("engine_util.GetMetaFromTxn err(applyStatus err) %v", err)
 		return 0, 0, err
 	}
 
 	idx := applyState.AppliedIndex
+	key := meta.RaftLogKey(regionId, idx)
+	log.Infof("Snapshot Read Key Hex: %x, Index: %d", key, idx)
 	var term uint64
 	if idx == applyState.TruncatedState.Index {
 		term = applyState.TruncatedState.Term
 	} else {
 		entry, err := meta.GetRaftEntry(raft, regionId, idx)
 		if err != nil {
+			log.Errorf("meta.GetRaftEntry err(log lost) %v", err)
+
 			return 0, 0, err
 		} else {
 			term = entry.GetTerm()
@@ -168,9 +175,10 @@ func doSnapshot(engines *engine_util.Engines, mgr *snap.SnapManager, regionId ui
 
 	index, term, err := getAppliedIdxTermForSnapshot(engines.Raft, txn, regionId)
 	if err != nil {
+		log.Errorf("getAppliedIdxTermForSnapshot failed: %v", err) // <---
 		return nil, err
 	}
-
+	log.Infof("Snapshot Metadata: Index %d, Term %d", index, term)
 	key := snap.SnapKey{RegionID: regionId, Index: index, Term: term}
 	mgr.Register(key, snap.SnapEntryGenerating)
 	defer mgr.Deregister(key, snap.SnapEntryGenerating)
@@ -193,17 +201,22 @@ func doSnapshot(engines *engine_util.Engines, mgr *snap.SnapManager, regionId ui
 			ConfState: &confState,
 		},
 	}
+
 	s, err := mgr.GetSnapshotForBuilding(key)
 	if err != nil {
+		log.Infof("===========================Err1")
 		return nil, err
 	}
+
 	// Set snapshot data
 	snapshotData := &rspb.RaftSnapshotData{Region: region}
 	snapshotStatics := snap.SnapStatistics{}
 	err = s.Build(txn, region, snapshotData, &snapshotStatics, mgr)
 	if err != nil {
+		log.Errorf("Snapshot Build failed: %v", err) // <---
 		return nil, err
 	}
 	snapshot.Data, err = snapshotData.Marshal()
+	log.Debug("====snapshotTRACE 1 ==== Snapshot Generated")
 	return snapshot, err
 }

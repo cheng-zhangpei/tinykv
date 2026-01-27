@@ -2,6 +2,7 @@ package raft_storage
 
 import (
 	"context"
+	"github.com/pingcap-incubator/tinykv/log"
 	"time"
 
 	"github.com/pingcap-incubator/tinykv/kv/util/worker"
@@ -14,6 +15,7 @@ import (
 // Handle will resolve t's storeID into the address of the TinyKV node which should handle t. t's callback is then
 // called with that address.
 func (r *resolverRunner) Handle(t worker.Task) {
+	log.Infof("***** TRACE 4: Runner received task")
 	data := t.(*resolveAddrTask)
 	data.callback(r.getAddr(data.storeID))
 }
@@ -43,12 +45,16 @@ func newResolverRunner(schedulerClient scheduler_client.Client) *resolverRunner 
 }
 
 func (r *resolverRunner) getAddr(id uint64) (string, error) {
+	log.Infof("***** TRACE 6:enter the runner of sending msg")
 	if sa, ok := r.storeAddrs[id]; ok {
 		if time.Since(sa.lastUpdate).Seconds() < storeAddressRefreshSeconds {
 			return sa.addr, nil
 		}
 	}
-	store, err := r.schedulerClient.GetStore(context.TODO(), id)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	store, err := r.schedulerClient.GetStore(ctx, id)
+	log.Infof("***** TRACE 5(resolverRunner.getAddr): PD returned: store=%v, %v", store, err)
 	if err != nil {
 		return "", err
 	}

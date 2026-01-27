@@ -823,6 +823,7 @@ func (d *peerMsgHandler) processConfChange(entry *eraftpb.Entry, cc *eraftpb.Con
 	}
 	// 3. 修改 Region 元数据
 	region := d.Region()
+	log.Infof("====conf change TRACE1====Start conf change,the number of region peer %d", len(region.Peers))
 	switch cc.ChangeType {
 	case eraftpb.ConfChangeType_AddNode:
 		if util.FindPeer(region, cc.NodeId) == nil {
@@ -857,6 +858,8 @@ func (d *peerMsgHandler) processConfChange(entry *eraftpb.Entry, cc *eraftpb.Con
 
 	// 6. 别忘了通知 Callback！(虽然 AdminRequest.ChangePeer 是空的 Response)
 	// ProposeConfChange 的时候也挂了 Callback
+	log.Infof("====conf change TRACE2====Start conf change,the number of region peer %d", len(region.Peers))
+
 	d.handleCallback(entry.Index, entry.Term, &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{},
 		AdminResponse: &raft_cmdpb.AdminResponse{

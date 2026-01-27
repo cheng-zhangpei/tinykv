@@ -174,6 +174,7 @@ func (ps *PeerStorage) Term(idx uint64) (uint64, error) {
 	}
 	var entry eraftpb.Entry
 	if err := engine_util.GetMeta(ps.Engines.Raft, meta.RaftLogKey(ps.region.Id, idx), &entry); err != nil {
+		log.Errorf("Log %d not found! Truncated: %d, Last: %d", idx, ps.truncatedIndex(), ps.raftState.LastIndex)
 		return 0, err
 	}
 	return entry.Term, nil
@@ -305,6 +306,7 @@ func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 
 // ClearMeta delete stale metadata like raftState, applyState, regionState and raft log entries
 func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatch, regionID uint64, lastIndex uint64) error {
+	log.Infof("CompactLog RegionID: %d, Truncate To: %d", regionID, lastIndex)
 	start := time.Now()
 	kvWB.DeleteMeta(meta.RegionStateKey(regionID))
 	kvWB.DeleteMeta(meta.ApplyStateKey(regionID))
@@ -377,6 +379,10 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 //		return nil
 //	}
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
+	log.Infof("Append: Writing to RaftDB Ptr: %p, RegionID: %d", ps.Engines.Raft, ps.region.Id)
+	log.Infof("Append called with %d entries. Truncated: %d", len(entries), ps.truncatedIndex())
+	log.Infof("Append RegionID: %d, Entries: %d -> %d", ps.region.Id, entries[0].Index, entries[len(entries)-1].Index)
+
 	if len(entries) == 0 {
 		return nil
 	}
@@ -388,6 +394,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 	hasValidEntry := false
 	for _, entry := range entries {
+		log.Infof("Writing Log: Region %d, Index %d", ps.region.Id, entry.Index)
 		// 截断保护
 		// 如果这条日志的 Index 小于等于当前的 TruncatedIndex，说明它是快照之前的老黄历了。
 		// 绝对不能写进去，否则会把 Snapshot 的成果搞乱，甚至覆盖掉元数据。
@@ -403,6 +410,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 		// 生成 Key: 格式通常是 z{regionID}_{index}
 		key := meta.RaftLogKey(ps.region.Id, entry.Index)
+		log.Infof("Append Key Hex: %x, Index: %d", key, entry.Index)
 
 		// 写入 Batch (注意是 Default CF)
 		raftWB.SetCF(engine_util.CfDefault, key, val)

@@ -78,6 +78,7 @@ func (t *MockTransport) Send(msg *raft_serverpb.RaftMessage) error {
 
 	fromStore := msg.GetFromPeer().GetStoreId()
 	toStore := msg.GetToPeer().GetStoreId()
+	log.Infof("Sending msg to store %d, to peer %d,type %v", toStore, msg.ToPeer, msg.Message.MsgType)
 
 	isSnapshot := msg.GetMessage().GetMsgType() == eraftpb.MessageType_MsgSnapshot
 	if isSnapshot {

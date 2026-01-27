@@ -231,16 +231,29 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// get the expectation of follower`s log state
 	progress := r.Prs[to]
 	prevLogIndex := progress.Next - 1
+	firstIndex, _ := r.RaftLog.storage.FirstIndex()
+	if prevLogIndex < firstIndex-1 {
+		log.Debugf("Send Snapshot because log gap: Need %d, First %d", prevLogIndex+1, firstIndex)
+		r.sendSnapshot(to)
+		return false
+	}
+
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	// corner case: when the follower lack too many entries that the leader`s entries was compacted
 	// the entries have been compact, we should send the snapshot to follower
 	if err != nil {
 		if errors.Is(err, ErrCompacted) {
 			// send the snapshot to let follower get the entries from snapshot
+			log.Debug("====snapshot TRACE==== have compact error!")
 			r.sendSnapshot(to)
 			return false
+		} else {
+			log.Debug("====snapshot TRACE==== no compact error!")
 		}
 		return false
+	} else {
+		index, _ := r.RaftLog.storage.FirstIndex()
+		log.Debugf("沒有触发快照发送，%d,%d", index, r.Prs[to].Next)
 	}
 	ents, err := r.RaftLog.Entries(progress.Next, r.RaftLog.LastIndex()+1)
 	if err != nil {
@@ -735,6 +748,7 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	}
 	// if the follower
 	if m.Index < r.RaftLog.LastIndex() {
+		log.Debug("Index没有对齐，触发日志同步！")
 		r.sendAppend(m.From)
 	}
 }
@@ -769,7 +783,8 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.RaftLog.stabled = meta.Index
 	r.RaftLog.applied = meta.Index
 	r.RaftLog.entries = make([]pb.Entry, 0)
-
+	log.Debugf("====raftSnapshot===== the snapshot pointer in raftLayer: committed=%d, applied=%d,prNext=%d,FirstIndex=%d", r.RaftLog.committed,
+		r.RaftLog.applied, r.Prs[m.From].Next)
 	r.sendAppendResponse(m.From, false, meta.Index, 0)
 	return
 }
@@ -837,7 +852,12 @@ func (r *Raft) sendSnapshot(to uint64) {
 	snapshot, err := r.RaftLog.storage.Snapshot()
 	// 可能快照还在生成，就跳过就好了
 	if err != nil {
+		if errors.Is(err, ErrSnapshotTemporarilyUnavailable) {
+			log.Debug("=====SnapShot TRACE==== the snapshot is not yet generate")
+		}
 		return
+	} else {
+		log.Debug("=====SnapShot TRACE==== the snapshot is generate successfully!")
 	}
 	msg := pb.Message{
 		MsgType:  pb.MessageType_MsgSnapshot,

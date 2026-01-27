@@ -143,6 +143,7 @@ type SecurityOption struct {
 func NewClient(pdAddrs []string, security SecurityOption) (Client, error) {
 	log.Info("[pd] create pd client with endpoints", zap.Strings("pd-address", pdAddrs))
 	ctx, cancel := context.WithCancel(context.Background())
+
 	c := &client{
 		urls:          addrsToUrls(pdAddrs),
 		tsoRequests:   make(chan *tsoRequest, maxMergeTSORequests),
