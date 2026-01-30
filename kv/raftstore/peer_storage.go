@@ -307,12 +307,15 @@ func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 // ClearMeta delete stale metadata like raftState, applyState, regionState and raft log entries
 func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatch, regionID uint64, lastIndex uint64) error {
 	log.Infof("CompactLog RegionID: %d, Truncate To: %d", regionID, lastIndex)
+
 	start := time.Now()
 	kvWB.DeleteMeta(meta.RegionStateKey(regionID))
 	kvWB.DeleteMeta(meta.ApplyStateKey(regionID))
 
 	firstIndex := lastIndex + 1
 	beginLogKey := meta.RaftLogKey(regionID, 0)
+	log.Infof("===========Deleting Log Range: [%d, %d]", firstIndex, lastIndex)
+
 	endLogKey := meta.RaftLogKey(regionID, firstIndex)
 	err := engines.Raft.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
@@ -415,12 +418,13 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		// 写入 Batch (注意是 Default CF)
 		raftWB.SetCF(engine_util.CfDefault, key, val)
 		// 记录有效的最后一条日志信息
+
 		lastIndex = entry.Index
 		lastTerm = entry.Term
 		hasValidEntry = true
 
 	}
-
+	log.Infof("========Lastes Log Write Key In ps.Append Func====key %x", meta.RaftLogKey(ps.region.Id, lastIndex))
 	// 【防守 2】更新内存状态 (RaftState)
 	// 只有当不仅写入了数据，而且新的 Index 确实比旧的 LastIndex 大（或者因为 Raft 语义是覆盖，所以直接更新）时才更新。
 	// 在 Raft 中，Append 意味着“从这儿开始，后面的以我为准”。
@@ -500,6 +504,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		if err := ps.Append(ready.Entries, raftWB); err != nil {
 			return nil, err
 		}
+
 	}
 
 	// 2. 处理 HardState (更新内存 HardState)
@@ -512,6 +517,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// 只要有日志追加，或者 HardState 变了，都要保存！
 	// 哪怕 HardState 没变，LastIndex 变了也得保存！
 	if len(ready.Entries) > 0 || !raft.IsEmptyHardState(ready.HardState) {
+		//log.Debugf("==================State Set Meta===========key: %x", meta.RaftStateKey(ps.region.Id))
 		if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
 			return nil, err
 		}
@@ -524,17 +530,70 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		}
 	}
 	if raftWB.Len() > 0 {
-		// first key:
+		// 【新增】打印 Batch 里的内容
+		//log.Infof("DEBUG: RaftWB Len=%d", raftWB.Len())
+		// 如果你能访问 raftWB 的内部切片，最好打印一下第一条 Write 的 Key
+		// 或者我们相信 Append 里的日志
 
 		if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 			return nil, err
 		}
-		//if len(ps.startKeys) == 1 {
-		//	log.Infof("raft states: firstIndex:%d lastIndex:%d", ps.truncatedIndex()+1, ps.raftState.LastIndex)
-		//	log.Infof("(entries persist)firstKey: %v\n", ps.startKeys[0])
-		//}
+		//	log.Infof("=======================================WriteTEst====================================")
+		//
+		//	if len(ready.Entries) > 0 {
+		//		lastEnt := ready.Entries[len(ready.Entries)-1]
+		//		checkKey := meta.RaftLogKey(ps.region.Id, lastEnt.Index) // todo CF prefix
+		//
+		//		// 打印写入时的预期 Key
+		//		log.Infof("DEBUG: Expect Written Key: %x", checkKey)
+		//
+		//		// 1. 尝试 GetMeta 读取
+		//		var verifyEnt eraftpb.Entry
+		//		err := engine_util.GetMeta(ps.Engines.Raft, checkKey, &verifyEnt)
+		//		if err != nil {
+		//			log.Errorf("PANIC: GetMeta Log %d failed: %v. Key used: %x", lastEnt.Index, err, checkKey)
+		//		} else {
+		//			log.Infof("VERIFY: GetMeta Log %d OK. Term: %d", verifyEnt.Index, verifyEnt.Term)
+		//		}
+		//
+		//		// 2. 尝试 Manual View 读取
+		//		err = ps.Engines.Raft.View(func(txn *badger.Txn) error {
+		//			log.Infof("DEBUG: Manual View searching Key: %x", checkKey)
+		//			item, err := txn.Get(checkKey)
+		//			if err != nil {
+		//				return err
+		//			}
+		//
+		//			// 打印找到的 Item 的 Key (看看有没有前缀差异)
+		//			log.Infof("DEBUG: Manual View Found Item Key: %x", item.Key())
+		//
+		//			val, err := item.Value()
+		//			if err != nil {
+		//				return err
+		//			}
+		//
+		//			log.Infof("MANUAL READ: Found Log %d, Len %d, ValHex: %x", lastEnt.Index, len(val), val)
+		//			return nil
+		//		})
+		//
+		//		if err != nil {
+		//			log.Errorf("MANUAL READ FAIL: %v", err)
+		//			log.Infof("=== DUMPING ALL RAFTDB KEYS ===")
+		//			_ = ps.Engines.Raft.View(func(txn *badger.Txn) error {
+		//				opts := badger.DefaultIteratorOptions
+		//				it := txn.NewIterator(opts)
+		//				defer it.Close()
+		//				for it.Rewind(); it.Valid(); it.Next() {
+		//					item := it.Item()
+		//					k := item.Key()
+		//					log.Infof("Existing Key: %x", k)
+		//				}
+		//				return nil
+		//			})
+		//			log.Infof("=== DUMP END ===")
+		//		}
+		//	}
 	}
-
 	return snapResult, nil
 }
 

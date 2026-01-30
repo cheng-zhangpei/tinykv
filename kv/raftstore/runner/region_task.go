@@ -159,7 +159,6 @@ func getAppliedIdxTermForSnapshot(raft *badger.DB, kv *badger.Txn, regionId uint
 		entry, err := meta.GetRaftEntry(raft, regionId, idx)
 		if err != nil {
 			log.Errorf("meta.GetRaftEntry err(log lost) %v", err)
-
 			return 0, 0, err
 		} else {
 			term = entry.GetTerm()

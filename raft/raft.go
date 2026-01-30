@@ -764,29 +764,50 @@ func (r *Raft) handleBeat(m pb.Message) {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// follower should check the message
 	meta := m.Snapshot.Metadata
+
+	// 1. Term 检查 (Safety)
 	if m.Term < r.Term {
+		return // 拒绝旧 Leader 的快照
+	}
+
+	// 2. 如果快照比我的 Commit Index 还旧，说明是过期的，忽略
+	if meta.Index <= r.RaftLog.committed {
+		// 告诉 Leader 我现在的进度，让它决定发什么
+		r.sendAppendResponse(m.From, false, r.RaftLog.committed, 0)
 		return
 	}
-	// check the committed pointer and the index of the snapshot
-	if m.Index < r.RaftLog.committed {
-		r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex(), 0)
-	}
-	// clear the log and entries
+
+	// 3. 变成 Follower (因为发快照的肯定是合法 Leader)
 	r.becomeFollower(m.Term, m.From)
 
-	// change the raftLog status
+	// 4. 应用快照到 RaftLog
+	// 这会清空 entries，更新 committed/applied/stabled
+	// 以及将 pendingSnapshot 设置为 m.Snapshot
+	// 注意：RaftLog 内部应该有一个 restore 方法，如果没有，手动做
+	r.RaftLog.entries = nil // 清空日志
 	r.RaftLog.pendingSnapshot = m.Snapshot
-	// all these pointer are the same, the entries of the snapshot are committed, applied and stabled
+
 	r.RaftLog.committed = meta.Index
-	r.RaftLog.stabled = meta.Index
 	r.RaftLog.applied = meta.Index
-	r.RaftLog.entries = make([]pb.Entry, 0)
-	log.Debugf("====raftSnapshot===== the snapshot pointer in raftLayer: committed=%d, applied=%d,prNext=%d,FirstIndex=%d", r.RaftLog.committed,
-		r.RaftLog.applied, r.Prs[m.From].Next)
+	r.RaftLog.stabled = meta.Index
+
+	// 更新 LastIndex (重要！否则下次 Append 可能会错)
+	// 实际上 pendingSnapshot 存在时，LastIndex 应该取快照的 Index
+	// 这部分逻辑通常在 RaftLog.LastIndex() 里处理，或者在 storage.Snapshot() 里处理
+
+	// 5. 【关键新增】根据快照更新集群配置 (Prs)
+	if meta.ConfState != nil {
+		r.Prs = make(map[uint64]*Progress)
+		for _, nodeID := range meta.ConfState.Nodes {
+			// 初始化 Progress
+			// Match=0, Next=1 (等待 Leader 发送)
+			r.Prs[nodeID] = &Progress{Next: 1, Match: 0}
+		}
+	}
+
+	// 6. 告诉 Leader 我收到了，并且我的进度更新到了 meta.Index
 	r.sendAppendResponse(m.From, false, meta.Index, 0)
-	return
 }
 
 func (r *Raft) handleTimeoutNow(m pb.Message) {

@@ -32,11 +32,31 @@ func GetApplyState(db *badger.DB, regionId uint64) (*rspb.RaftApplyState, error)
 	return applyState, nil
 }
 
+//	func GetRaftEntry(db *badger.DB, regionId, idx uint64) (*eraftpb.Entry, error) {
+//		entry := new(eraftpb.Entry)
+//		if err := engine_util.GetMeta(db, RaftLogKey(regionId, idx), entry); err != nil {
+//			return nil, err
+//		}
+//		return entry, nil
+//	}
 func GetRaftEntry(db *badger.DB, regionId, idx uint64) (*eraftpb.Entry, error) {
 	entry := new(eraftpb.Entry)
-	if err := engine_util.GetMeta(db, RaftLogKey(regionId, idx), entry); err != nil {
+
+	// 生成 Raw Key
+	key := RaftLogKey(regionId, idx)
+
+	// 【关键修改】改用 GetCF (传入 CfDefault)
+	// 这样它会自动加上 "default_" 前缀，就能匹配上 Append 写入的数据了
+	val, err := engine_util.GetCF(db, engine_util.CfDefault, key)
+	if err != nil {
 		return nil, err
 	}
+
+	// 反序列化
+	if err := entry.Unmarshal(val); err != nil {
+		return nil, err
+	}
+
 	return entry, nil
 }
 
